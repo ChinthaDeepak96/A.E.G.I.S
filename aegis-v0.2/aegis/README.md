@@ -8,10 +8,10 @@ versions, per the project roadmap.
 
 ## What this is (and isn't)
 
-**Is:** a conversation loop that talks to Claude as "MAX", holds
-context across a session, and can list/read files, check system
-info, or run a shell command — with every tool call reviewed by
-Guardian Lite first.
+**Is:** a conversation loop that talks to MAX (backed by either Claude
+or a free local model — your choice), holds context across a session,
+and can list/read files, check system info, or run a shell command —
+with every tool call reviewed by Guardian Lite first.
 
 **Isn't:** anything with memory across sessions, full audit logging,
 a real risk classifier, or open-ended computer control. Guardian
@@ -33,21 +33,42 @@ waits for an explicit `y`. If you run MAX programmatically (e.g. in
 tests) without passing a `confirm` callback, HIGH-risk calls are
 denied by default — Guardian fails closed, not open.
 
-## Setup
+## Two ways to run MAX
+
+| | Anthropic API | Local (Ollama) |
+|---|---|---|
+| Cost | Pay-per-token | Free, always |
+| Setup | API key from console.anthropic.com | Install [Ollama](https://ollama.com), pull a model |
+| Quality | Best — Claude Sonnet | Depends on your hardware and chosen model |
+| Tool-calling reliability | Strong | Varies by model (llama3.1, qwen2.5 recommended) |
+
+### Option A: Anthropic API (paid, best quality)
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # .venv\Scripts\activate on Windows
-pip install -r requirements.txt
 cp .env.example .env
 # edit .env and add your ANTHROPIC_API_KEY
-```
-
-## Run
-
-```bash
 python -m apps.cli
 ```
+
+### Option B: Local model via Ollama (free, no account needed)
+
+```bash
+# 1. Install Ollama: https://ollama.com/download
+# 2. Pull a model (llama3.1 handles tool-calling reasonably well)
+ollama pull llama3.1
+
+# 3. Set the provider and run — no .env, no API key, needed at all
+export AEGIS_PROVIDER=local
+python -m apps.cli
+```
+
+Optional env vars for the local path: `AEGIS_OLLAMA_MODEL` (default
+`llama3.1`), `AEGIS_OLLAMA_HOST` (default `http://localhost:11434`).
+
+This is the first real piece of the future Model Router (architecture
+doc section 51) — `core/llm_client.py` is still the only file that
+knows how to talk to any provider; `core/max.py` doesn't know or
+care which one is behind `self._llm`.
 
 ## Test
 
@@ -74,7 +95,7 @@ conversation, no crashes) still holds and is still tested.
 aegis/
 ├── core/
 │   ├── config.py       # settings from env / .env
-│   ├── llm_client.py   # the ONLY file that talks to the Anthropic API
+│   ├── llm_client.py   # talks to a provider — Anthropic API or local Ollama
 │   ├── max.py          # personality, conversation state, tool loop
 │   ├── tools.py         # tool registry (name, risk_category, handler)
 │   └── guardian.py      # Guardian Lite: risk_category -> ALLOW / CONFIRM
@@ -83,7 +104,8 @@ aegis/
 └── tests/
     ├── test_max.py
     ├── test_guardian.py
-    └── test_tools.py
+    ├── test_tools.py
+    └── test_ollama_client.py
 ```
 
 Deliberately not building out the full repository structure from the

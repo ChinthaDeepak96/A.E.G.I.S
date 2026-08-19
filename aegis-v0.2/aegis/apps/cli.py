@@ -10,7 +10,7 @@ whole codebase that can approve a MEDIUM/HIGH risk tool call.
 import sys
 
 from core.config import load_settings
-from core.llm_client import AnthropicClient
+from core.llm_client import AnthropicClient, OllamaClient
 from core.max import MAX
 
 
@@ -31,10 +31,15 @@ def main() -> None:
         api_key=settings.anthropic_api_key,
         model=settings.model,
         max_tokens=settings.max_tokens,
+    ) if settings.provider == "anthropic" else OllamaClient(
+        model=settings.ollama_model,
+        host=settings.ollama_host,
+        max_tokens=settings.max_tokens,
     )
     max_instance = MAX(client, history_limit=settings.history_limit)
 
-    print("A.E.G.I.S. v0.2 -- MAX is online. Type /help for commands, /quit to exit.\n")
+    print(f"A.E.G.I.S. v0.2 -- MAX is online (provider: {settings.provider}). "
+          f"Type /help for commands, /quit to exit.\n")
 
     while True:
         try:
@@ -46,7 +51,11 @@ def main() -> None:
         if not user_input:
             continue
 
-        reply = max_instance.respond(user_input, confirm=confirm_action)
+        try:
+            reply = max_instance.respond(user_input, confirm=confirm_action)
+        except RuntimeError as exc:
+            print(f"MAX> [connection error] {exc}\n")
+            continue
         print(f"MAX> {reply}\n")
 
         if max_instance.should_exit:

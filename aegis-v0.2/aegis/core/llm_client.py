@@ -78,6 +78,129 @@ class AnthropicClient:
         return LLMResponse(content=content, stop_reason=response.stop_reason)
 
 
+def _to_ollama_tool(anthropic_tool: dict) -> dict:
+    """Convert one of our Anthropic-shaped tool schemas (core/tools.py)
+    into Ollama's function-calling format."""
+    return {
+        "type": "function",
+        "function": {
+            "name": anthropic_tool["name"],
+            "description": anthropic_tool["description"],
+            "parameters": anthropic_tool["input_schema"],
+        },
+    }
+
+
+def _to_ollama_messages(messages: list[dict]) -> list[dict]:
+    """
+    Convert our Anthropic-shaped history (see core/max.py, which
+    stores messages in the exact shape the Anthropic API expects) into
+    Ollama's simpler format. tool_use blocks become an assistant
+    tool_calls entry; tool_result blocks become role="tool" messages.
+    """
+    converted = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+
+        if isinstance(content, str):
+            converted.append({"role": role, "content": content})
+            continue
+
+        text_parts = []
+        tool_calls = []
+        for block in content:
+            if block.get("type") == "text":
+                text_parts.append(block["text"])
+            elif block.get("type") == "tool_use":
+                tool_calls.append({"function": {"name": block["name"], "arguments": block["input"]}})
+            elif block.get("type") == "tool_result":
+                converted.append({"role": "tool", "content": str(block["content"])})
+
+        if text_parts or tool_calls:
+            entry = {"role": role, "content": "".join(text_parts)}
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
+            converted.append(entry)
+
+    return converted
+
+
+def _from_ollama_response(data: dict) -> LLMResponse:
+    message = data.get("message", {})
+    content = []
+
+    text = message.get("content") or ""
+    if text:
+        content.append(TextBlock(text=text))
+
+    tool_calls = message.get("tool_calls") or []
+    for i, call in enumerate(tool_calls):
+        function = call.get("function", {})
+        content.append(
+            ToolUseBlock(id=f"ollama_call_{i}", name=function.get("name", ""), input=function.get("arguments", {}) or {})
+        )
+
+    stop_reason = "tool_use" if tool_calls else "end_turn"
+    return LLMResponse(content=content, stop_reason=stop_reason)
+
+
+class OllamaClient:
+    """
+    Free, fully local alternative to AnthropicClient. Talks to a
+    locally running Ollama server (https://ollama.com) instead of a
+    paid API -- no API key, no account, no per-token cost, ever. This
+    is the first real piece of the future Model Router (architecture
+    doc section 51): same LLMClient interface, different provider.
+
+    Tool-calling reliability depends on which local model you pick --
+    llama3.1 and qwen2.5 handle it reasonably well; smaller or older
+    models may ignore tools or hallucinate arguments more often than
+    Claude does. That's a real trade-off of running for free on your
+    own hardware, not a bug in this client.
+    """
+
+    def __init__(self, model: str, host: str = "http://localhost:11434", max_tokens: int = 1024):
+        self._model = model
+        self._host = host.rstrip("/")
+        self._max_tokens = max_tokens
+
+    def send(self, system: str, messages: list[dict], tools: list[dict] | None = None) -> LLMResponse:
+        import json
+        import urllib.error
+        import urllib.request
+
+        ollama_messages = [{"role": "system", "content": system}]
+        ollama_messages.extend(_to_ollama_messages(messages))
+
+        payload = {
+            "model": self._model,
+            "messages": ollama_messages,
+            "stream": False,
+            "options": {"num_predict": self._max_tokens},
+        }
+        if tools:
+            payload["tools"] = [_to_ollama_tool(t) for t in tools]
+
+        request = urllib.request.Request(
+            f"{self._host}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = json.loads(response.read())
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"Could not reach Ollama at {self._host} -- is it running? "
+                f"Start it with `ollama serve` and make sure you've pulled "
+                f"a model with `ollama pull {self._model}`. ({exc})"
+            ) from exc
+
+        return _from_ollama_response(data)
+
+
 class MockClient:
     """
     Deterministic stand-in for AnthropicClient, used in tests and for
