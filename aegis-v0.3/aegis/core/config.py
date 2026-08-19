@@ -7,7 +7,8 @@ AEGIS_PROVIDER selects which LLMClient gets built (core/llm_client.py):
   - "local": free, runs against a local Ollama server, no key needed.
 
 This is the first piece of the future Model Router (architecture doc
-section 51) -- for now it's a single switch, not real routing logic.
+section 51) -- for now it's a single switch, not real routing logic.\
+
 """
 
 import os
@@ -39,7 +40,7 @@ def load_settings() -> Settings:
     history_limit = int(os.environ.get("AEGIS_HISTORY_LIMIT", "40"))
 
     if provider == "anthropic":
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise RuntimeError(
                 "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add "

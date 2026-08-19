@@ -1,6 +1,6 @@
 """
 v0.1 tests verify plain conversation still works unchanged. v0.2
-tests verify the actual done-when criterion for this version: MAX
+tests verify the actual done-when criterion for this version: AEGIS
 picks the right tool for a stated goal, and Guardian correctly
 blocks a MEDIUM/HIGH-risk tool call without any code change --
 just the absence of a confirm callback / a confirm callback that
@@ -8,7 +8,7 @@ says no.
 """
 
 from core.llm_client import LLMResponse, MockClient, TextBlock, ToolUseBlock
-from core.max import MAX, handle_command
+from core.aegis import AEGIS, handle_command
 
 # ---------------------------------------------------------------------------
 # v0.1: plain conversation, unchanged behavior
@@ -17,10 +17,10 @@ from core.max import MAX, handle_command
 
 def test_twenty_turn_conversation_survives():
     client = MockClient(reply="acknowledged.")
-    max_instance = MAX(client, history_limit=40)
+    aegis = AEGIS(client, history_limit=40)
 
     for i in range(20):
-        reply = max_instance.respond(f"message number {i}")
+        reply = aegis.respond(f"message number {i}")
         assert reply == "acknowledged."
 
     assert len(client.calls) == 20
@@ -29,10 +29,10 @@ def test_twenty_turn_conversation_survives():
 
 def test_history_trims_to_limit():
     client = MockClient()
-    max_instance = MAX(client, history_limit=4)
+    aegis = AEGIS(client, history_limit=4)
 
     for i in range(10):
-        max_instance.respond(f"message {i}")
+        aegis.respond(f"message {i}")
 
     last_call_messages = client.calls[-1]["messages"]
     assert len(last_call_messages) <= 4
@@ -40,31 +40,31 @@ def test_history_trims_to_limit():
 
 def test_reset_clears_history():
     client = MockClient()
-    max_instance = MAX(client, history_limit=40)
-    max_instance.respond("hello")
+    aegis = AEGIS(client, history_limit=40)
+    aegis.respond("hello")
     assert len(client.calls[-1]["messages"]) == 1
 
-    reply = max_instance.respond("/reset")
+    reply = aegis.respond("/reset")
     assert reply == "Conversation history cleared."
 
-    max_instance.respond("hello again")
+    aegis.respond("hello again")
     assert len(client.calls[-1]["messages"]) == 1
 
 
 def test_help_command_does_not_hit_llm():
     client = MockClient()
-    max_instance = MAX(client, history_limit=40)
-    reply = max_instance.respond("/help")
+    aegis = AEGIS(client, history_limit=40)
+    reply = aegis.respond("/help")
     assert "Available commands" in reply
     assert len(client.calls) == 0
 
 
 def test_quit_command_sets_exit_flag():
     client = MockClient()
-    max_instance = MAX(client, history_limit=40)
-    assert max_instance.should_exit is False
-    max_instance.respond("/quit")
-    assert max_instance.should_exit is True
+    aegis = AEGIS(client, history_limit=40)
+    assert aegis.should_exit is False
+    aegis.respond("/quit")
+    assert aegis.should_exit is True
 
 
 def test_unknown_command_reports_cleanly():
@@ -87,10 +87,10 @@ def test_low_risk_tool_executes_without_confirmation():
         LLMResponse(content=[TextBlock(text="Here is your system info.")], stop_reason="end_turn"),
     ]
     client = MockClient(responses=responses)
-    max_instance = MAX(client, history_limit=40)
+    aegis = AEGIS(client, history_limit=40)
 
     # No confirm callback -- a LOW-risk tool must not need one.
-    reply = max_instance.respond("what's my OS?")
+    reply = aegis.respond("what's my OS?")
     assert reply == "Here is your system info."
     assert len(client.calls) == 2
 
@@ -104,10 +104,10 @@ def test_high_risk_tool_blocked_without_confirmation():
         LLMResponse(content=[TextBlock(text="I wasn't able to run that.")], stop_reason="end_turn"),
     ]
     client = MockClient(responses=responses)
-    max_instance = MAX(client, history_limit=40)
+    aegis = AEGIS(client, history_limit=40)
 
     # No confirm callback at all -- Guardian must deny by default.
-    reply = max_instance.respond("list files via shell")
+    reply = aegis.respond("list files via shell")
     assert reply == "I wasn't able to run that."
 
     second_call_messages = client.calls[1]["messages"]
@@ -125,9 +125,9 @@ def test_high_risk_tool_denied_when_user_says_no():
         LLMResponse(content=[TextBlock(text="Understood, not running that.")], stop_reason="end_turn"),
     ]
     client = MockClient(responses=responses)
-    max_instance = MAX(client, history_limit=40)
+    aegis = AEGIS(client, history_limit=40)
 
-    reply = max_instance.respond("run rm -rf /", confirm=lambda *a: False)
+    reply = aegis.respond("run rm -rf /", confirm=lambda *a: False)
     assert reply == "Understood, not running that."
 
 
@@ -140,9 +140,9 @@ def test_high_risk_tool_runs_when_user_confirms():
         LLMResponse(content=[TextBlock(text="Done.")], stop_reason="end_turn"),
     ]
     client = MockClient(responses=responses)
-    max_instance = MAX(client, history_limit=40)
+    aegis = AEGIS(client, history_limit=40)
 
-    reply = max_instance.respond("run echo hi", confirm=lambda *a: True)
+    reply = aegis.respond("run echo hi", confirm=lambda *a: True)
     assert reply == "Done."
 
     # The actual command output should have reached the model as a tool_result.
@@ -160,7 +160,7 @@ def test_confirm_callback_receives_tool_name_risk_and_input():
         LLMResponse(content=[TextBlock(text="Done.")], stop_reason="end_turn"),
     ]
     client = MockClient(responses=responses)
-    max_instance = MAX(client, history_limit=40)
+    aegis = AEGIS(client, history_limit=40)
 
     seen = {}
 
@@ -170,7 +170,7 @@ def test_confirm_callback_receives_tool_name_risk_and_input():
         seen["params"] = params
         return True
 
-    max_instance.respond("run echo test", confirm=confirm)
+    aegis.respond("run echo test", confirm=confirm)
     assert seen["tool_name"] == "run_command"
     assert seen["risk"] == "HIGH"
     assert seen["params"] == {"command": "echo test"}
@@ -185,9 +185,9 @@ def test_unknown_tool_name_reports_error_without_crashing():
         LLMResponse(content=[TextBlock(text="That tool doesn't exist.")], stop_reason="end_turn"),
     ]
     client = MockClient(responses=responses)
-    max_instance = MAX(client, history_limit=40)
+    aegis = AEGIS(client, history_limit=40)
 
-    reply = max_instance.respond("use a fake tool")
+    reply = aegis.respond("use a fake tool")
     assert reply == "That tool doesn't exist."
 
 
@@ -200,8 +200,8 @@ def test_tool_loop_gives_up_after_max_iterations():
         stop_reason="tool_use",
     )
     client = MockClient(responses=[endless_tool_use] * 10)
-    max_instance = MAX(client, history_limit=100)
+    aegis = AEGIS(client, history_limit=100)
 
-    reply = max_instance.respond("keep checking my system info forever")
+    reply = aegis.respond("keep checking my system info forever")
     assert "wasn't able to finish" in reply
-    assert len(client.calls) == 5  # MAX_TOOL_ITERATIONS
+    assert len(client.calls) == 5  # TOOL_LOOP_LIMIT

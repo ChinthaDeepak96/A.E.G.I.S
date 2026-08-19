@@ -43,7 +43,7 @@ def load_settings() -> Settings:
         if not api_key:
             raise RuntimeError(
                 "ANTHROPIC_API_KEY is not set. Copy .env.example to .env and add "
-                "your key, or set AEGIS_PROVIDER=local to run MAX for free on a "
+                "your key, or set AEGIS_PROVIDER=local to run AEGIS for free on a "
                 "local Ollama model instead."
             )
         model = os.environ.get("AEGIS_MODEL", "claude-sonnet-4-6")

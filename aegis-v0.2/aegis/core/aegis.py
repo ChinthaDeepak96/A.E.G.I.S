@@ -1,8 +1,10 @@
 """
-MAX -- the conversational personality and primary human interface
-(architecture doc section 6).
+AEGIS -- the conversational personality and primary human interface
+(architecture doc section 6; renamed from "MAX" per project owner's
+request -- the assistant now identifies itself as AEGIS directly
+rather than under a separate character name).
 
-v0.2 adds tool use: MAX can now decide to call a tool, but every
+v0.2 adds tool use: AEGIS can now decide to call a tool, but every
 call is reviewed by Guardian Lite (core/guardian.py) first. LOW-risk
 tools execute automatically; MEDIUM/HIGH-risk tools are blocked
 unless the caller supplies a `confirm` callback that approves them.
@@ -18,7 +20,7 @@ from core import guardian
 from core.llm_client import LLMResponse, TextBlock, ToolUseBlock
 from core.tools import TOOLS, anthropic_tool_schemas
 
-SYSTEM_PROMPT = """You are MAX, the personal AI interface for the A.E.G.I.S. \
+SYSTEM_PROMPT = """You are AEGIS, the personal AI interface for the A.E.G.I.S. \
 platform (Autonomous Electronic Guardian Intelligence System).
 
 You are running in v0.2: you have access to a small set of tools \
@@ -35,10 +37,10 @@ plainly that it isn't built yet.
 Personality: calm, direct, competent. Brief by default; detailed \
 when the question calls for it. No excessive enthusiasm, no filler."""
 
-# Bounded retries (architecture doc section 22): MAX should not loop
-# on itself indefinitely if the model keeps requesting tools without
-# ever reaching a final answer.
-MAX_TOOL_ITERATIONS = 5
+# Bounded retries (architecture doc section 22): AEGIS should not
+# loop on itself indefinitely if the model keeps requesting tools
+# without ever reaching a final answer.
+TOOL_LOOP_LIMIT = 5
 
 ConfirmCallback = Callable[[str, str, dict], bool]
 
@@ -72,7 +74,7 @@ def handle_command(text: str) -> CommandResult:
                 "  /help   - show this message\n"
                 "  /reset  - clear conversation history\n"
                 "  /quit   - exit\n"
-                "Anything else is sent to MAX as conversation."
+                "Anything else is sent to AEGIS as conversation."
             ),
         )
     if command == "reset":
@@ -101,7 +103,7 @@ def _extract_text(response: LLMResponse) -> str:
     return "".join(b.text for b in response.content if isinstance(b, TextBlock))
 
 
-class MAX:
+class AEGIS:
     """
     Owns conversation state (working memory only, for v0.1/v0.2) and
     routes input between command handling, tool use, and the LLM.
@@ -131,7 +133,7 @@ class MAX:
 
         tools_schema = anthropic_tool_schemas()
 
-        for _ in range(MAX_TOOL_ITERATIONS):
+        for _ in range(TOOL_LOOP_LIMIT):
             response = self._llm.send(system=SYSTEM_PROMPT, messages=self._history, tools=tools_schema)
             self._history.append({"role": "assistant", "content": _response_to_api_content(response)})
             self._trim_history()

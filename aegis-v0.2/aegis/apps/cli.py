@@ -11,11 +11,11 @@ import sys
 
 from core.config import load_settings
 from core.llm_client import AnthropicClient, OllamaClient
-from core.max import MAX
+from core.aegis import AEGIS
 
 
 def confirm_action(tool_name: str, risk: str, params: dict) -> bool:
-    print(f"\n[Guardian] MAX wants to run '{tool_name}' (risk: {risk}) with input: {params}")
+    print(f"\n[Guardian] AEGIS wants to run '{tool_name}' (risk: {risk}) with input: {params}")
     answer = input("Allow? [y/N] ").strip().lower()
     return answer == "y"
 
@@ -36,9 +36,9 @@ def main() -> None:
         host=settings.ollama_host,
         max_tokens=settings.max_tokens,
     )
-    max_instance = MAX(client, history_limit=settings.history_limit)
+    aegis = AEGIS(client, history_limit=settings.history_limit)
 
-    print(f"A.E.G.I.S. v0.2 -- MAX is online (provider: {settings.provider}). "
+    print(f"A.E.G.I.S. v0.2 -- AEGIS is online (provider: {settings.provider}). "
           f"Type /help for commands, /quit to exit.\n")
 
     while True:
@@ -52,13 +52,13 @@ def main() -> None:
             continue
 
         try:
-            reply = max_instance.respond(user_input, confirm=confirm_action)
+            reply = aegis.respond(user_input, confirm=confirm_action)
         except RuntimeError as exc:
-            print(f"MAX> [connection error] {exc}\n")
+            print(f"AEGIS> [connection error] {exc}\n")
             continue
-        print(f"MAX> {reply}\n")
+        print(f"AEGIS> {reply}\n")
 
-        if max_instance.should_exit:
+        if aegis.should_exit:
             break
 
 

@@ -5,7 +5,7 @@ This is intentionally the ONLY file that knows how to talk to a
 model provider. Everything else in core/ talks to an LLMClient, not
 to the Anthropic SDK directly. That is what makes the future Model
 Router (architecture doc section 51 -- routing between local/cloud
-models) a change to this one file instead of a rewrite of MAX.
+models) a change to this one file instead of a rewrite of AEGIS.
 
 v0.2 adds tool-use support. Responses are normalized into
 LLMResponse/TextBlock/ToolUseBlock -- a provider-agnostic shape --
