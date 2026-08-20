@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from .models import Memory, MemoryType
+from .models import Memory, MemoryStatus, MemoryType
 
 
 SCHEMA = """
@@ -17,18 +17,13 @@ CREATE TABLE IF NOT EXISTS memories (
     source TEXT NOT NULL,
     tags_json TEXT NOT NULL,
     metadata_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    stale_at TEXT,
+    archived_at TEXT,
+    superseded_by TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_memories_type
-    ON memories(memory_type);
-
-CREATE INDEX IF NOT EXISTS idx_memories_created
-    ON memories(created_at);
-
-CREATE INDEX IF NOT EXISTS idx_memories_importance
-    ON memories(importance);
 """
 
 
@@ -36,16 +31,12 @@ class SQLiteMemoryStore:
     """
     SQLite-backed persistent memory store.
 
-    Supports both:
+    Supports:
+        - normal file-backed SQLite databases
+        - SQLite :memory: databases
 
-        data/aegis_memory.db
-
-    and:
-
-        :memory:
-
-    The in-memory database keeps one persistent connection so all
-    operations use the same SQLite database.
+    Also performs automatic migration of older A.E.G.I.S.
+    memory databases to the v0.4.3 lifecycle schema.
     """
 
     def __init__(
@@ -57,11 +48,7 @@ class SQLiteMemoryStore:
         self._connection: sqlite3.Connection | None = None
 
         # ---------------------------------------------------------
-        # Special handling for SQLite in-memory databases.
-        #
-        # Each sqlite3.connect(":memory:") normally creates a
-        # completely separate database. Therefore we must keep
-        # one connection alive for the lifetime of this store.
+        # In-memory database
         # ---------------------------------------------------------
 
         if str(path) == ":memory:":
@@ -71,7 +58,9 @@ class SQLiteMemoryStore:
 
             self._connection.row_factory = sqlite3.Row
 
-            self._initialize()
+        # ---------------------------------------------------------
+        # File-backed database
+        # ---------------------------------------------------------
 
         else:
             self.path.parent.mkdir(
@@ -79,21 +68,15 @@ class SQLiteMemoryStore:
                 exist_ok=True,
             )
 
-            self._initialize()
+        self._initialize()
 
     # =========================================================
-    # CONNECTION MANAGEMENT
+    # CONNECTION
     # =========================================================
 
     def _connect(self) -> sqlite3.Connection:
         """
         Return the appropriate SQLite connection.
-
-        Persistent database:
-            Creates a normal short-lived connection.
-
-        In-memory database:
-            Returns the single persistent connection.
         """
 
         if self._connection is not None:
@@ -107,33 +90,177 @@ class SQLiteMemoryStore:
 
         return connection
 
+    # =========================================================
+    # INITIALIZATION + MIGRATION
+    # =========================================================
+
     def _initialize(self) -> None:
         """
-        Create the database schema if it doesn't already exist.
+        Create the database or migrate an existing database.
         """
 
         conn = self._connect()
 
-        if self._connection is not None:
-            conn.executescript(SCHEMA)
-            conn.commit()
-            return
+        # Check whether the memories table already exists.
+        table_exists = conn.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'memories'
+            """
+        ).fetchone()
 
-        with conn:
-            conn.executescript(SCHEMA)
+        # ---------------------------------------------------------
+        # Existing database
+        # ---------------------------------------------------------
 
-        conn.close()
+        if table_exists:
+
+            self._migrate_schema(
+                conn
+            )
+
+        # ---------------------------------------------------------
+        # New database
+        # ---------------------------------------------------------
+
+        else:
+
+            conn.executescript(
+                SCHEMA
+            )
+
+        # ---------------------------------------------------------
+        # Indexes
+        #
+        # These are deliberately created AFTER migration so an old
+        # database does not fail because status doesn't exist yet.
+        # ---------------------------------------------------------
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memories_type
+            ON memories(memory_type)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memories_created
+            ON memories(created_at)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memories_importance
+            ON memories(importance)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_memories_status
+            ON memories(status)
+            """
+        )
+
+        conn.commit()
+
+        if self._connection is None:
+            conn.close()
+
+    def _migrate_schema(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """
+        Upgrade a pre-v0.4.3 A.E.G.I.S. memory database.
+
+        Existing memories receive:
+            status = active
+
+        New lifecycle columns are added only when missing.
+        """
+
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(memories)"
+            ).fetchall()
+        }
+
+        # ---------------------------------------------------------
+        # Lifecycle columns
+        # ---------------------------------------------------------
+
+        if "status" not in columns:
+
+            conn.execute(
+                """
+                ALTER TABLE memories
+                ADD COLUMN status TEXT
+                NOT NULL
+                DEFAULT 'active'
+                """
+            )
+
+        if "stale_at" not in columns:
+
+            conn.execute(
+                """
+                ALTER TABLE memories
+                ADD COLUMN stale_at TEXT
+                """
+            )
+
+        if "archived_at" not in columns:
+
+            conn.execute(
+                """
+                ALTER TABLE memories
+                ADD COLUMN archived_at TEXT
+                """
+            )
+
+        if "superseded_by" not in columns:
+
+            conn.execute(
+                """
+                ALTER TABLE memories
+                ADD COLUMN superseded_by TEXT
+                """
+            )
+
+        # ---------------------------------------------------------
+        # Defensive migration
+        #
+        # Existing rows should always be considered ACTIVE.
+        # ---------------------------------------------------------
+
+        conn.execute(
+            """
+            UPDATE memories
+            SET status = 'active'
+            WHERE status IS NULL
+               OR status = ''
+            """
+        )
+
+    # =========================================================
+    # CLOSE
+    # =========================================================
 
     def close(self) -> None:
         """
         Close the persistent in-memory connection.
-
-        Normal file-backed connections are opened and closed per
-        operation, so there is nothing to close here.
         """
 
         if self._connection is not None:
+
             self._connection.close()
+
             self._connection = None
 
     # =========================================================
@@ -144,57 +271,42 @@ class SQLiteMemoryStore:
         self,
         memory: Memory,
     ) -> Memory:
+
         conn = self._connect()
 
-        if self._connection is not None:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO memories
-                (
-                    id,
-                    memory_type,
-                    content,
-                    importance,
-                    confidence,
-                    sensitivity,
-                    source,
-                    tags_json,
-                    metadata_json,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                memory.to_record(),
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO memories
+            (
+                id,
+                memory_type,
+                content,
+                importance,
+                confidence,
+                sensitivity,
+                source,
+                tags_json,
+                metadata_json,
+                status,
+                created_at,
+                updated_at,
+                stale_at,
+                archived_at,
+                superseded_by
             )
-
-            conn.commit()
-
-            return memory
-
-        with conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO memories
-                (
-                    id,
-                    memory_type,
-                    content,
-                    importance,
-                    confidence,
-                    sensitivity,
-                    source,
-                    tags_json,
-                    metadata_json,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                memory.to_record(),
+            VALUES (
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?
             )
+            """,
+            memory.to_record(),
+        )
 
-        conn.close()
+        conn.commit()
+
+        if self._connection is None:
+            conn.close()
 
         return memory
 
@@ -221,8 +333,12 @@ class SQLiteMemoryStore:
                 source,
                 tags_json,
                 metadata_json,
+                status,
                 created_at,
-                updated_at
+                updated_at,
+                stale_at,
+                archived_at,
+                superseded_by
             FROM memories
             WHERE id = ?
             """,
@@ -232,10 +348,11 @@ class SQLiteMemoryStore:
         if self._connection is None:
             conn.close()
 
-        return (
-            Memory.from_row(tuple(row))
-            if row
-            else None
+        if row is None:
+            return None
+
+        return Memory.from_row(
+            tuple(row)
         )
 
     # =========================================================
@@ -257,11 +374,9 @@ class SQLiteMemoryStore:
             (memory_id,),
         )
 
-        if self._connection is not None:
-            conn.commit()
+        conn.commit()
 
-        else:
-            conn.commit()
+        if self._connection is None:
             conn.close()
 
         return cursor.rowcount > 0
@@ -275,14 +390,14 @@ class SQLiteMemoryStore:
         conn = self._connect()
 
         cursor = conn.execute(
-            "DELETE FROM memories"
+            """
+            DELETE FROM memories
+            """
         )
 
-        if self._connection is not None:
-            conn.commit()
+        conn.commit()
 
-        else:
-            conn.commit()
+        if self._connection is None:
             conn.close()
 
         return cursor.rowcount
@@ -294,6 +409,7 @@ class SQLiteMemoryStore:
     def list(
         self,
         memory_type: MemoryType | None = None,
+        status: MemoryStatus | None = None,
         limit: int = 100,
     ) -> list[Memory]:
 
@@ -308,20 +424,43 @@ class SQLiteMemoryStore:
             source,
             tags_json,
             metadata_json,
+            status,
             created_at,
-            updated_at
+            updated_at,
+            stale_at,
+            archived_at,
+            superseded_by
         FROM memories
         """
 
+        conditions: list[str] = []
         params: list[object] = []
 
-        if memory_type:
-            query += """
-            WHERE memory_type = ?
-            """
+        if memory_type is not None:
+
+            conditions.append(
+                "memory_type = ?"
+            )
 
             params.append(
                 memory_type.value
+            )
+
+        if status is not None:
+
+            conditions.append(
+                "status = ?"
+            )
+
+            params.append(
+                status.value
+            )
+
+        if conditions:
+
+            query += (
+                " WHERE "
+                + " AND ".join(conditions)
             )
 
         query += """
@@ -344,11 +483,68 @@ class SQLiteMemoryStore:
             conn.close()
 
         return [
-            Memory.from_row(tuple(row))
+            Memory.from_row(
+                tuple(row)
+            )
             for row in rows
         ]
 
     # =========================================================
+    # UPDATE STATUS
+    # =========================================================
+
+    def update_status(
+        self,
+        memory_id: str,
+        status: MemoryStatus,
+        *,
+        superseded_by: str | None = None,
+    ) -> Memory | None:
+
+        memory = self.get(
+            memory_id
+        )
+
+        if memory is None:
+            return None
+
+        if status == MemoryStatus.NEW:
+
+            memory.status = (
+                MemoryStatus.NEW
+            )
+
+            memory.touch()
+
+        elif status == MemoryStatus.ACTIVE:
+
+            memory.activate()
+
+        elif status == MemoryStatus.STALE:
+
+            memory.mark_stale()
+
+        elif status == MemoryStatus.ARCHIVED:
+
+            memory.archive()
+
+        elif status == MemoryStatus.SUPERSEDED:
+
+            if not superseded_by:
+                raise ValueError(
+                    "superseded_by is required "
+                    "for SUPERSEDED memories"
+                )
+
+            memory.supersede(
+                superseded_by
+            )
+
+        return self.save(
+            memory
+        )
+
+        # =========================================================
     # TEXT SEARCH
     # =========================================================
 
@@ -356,66 +552,196 @@ class SQLiteMemoryStore:
         self,
         query: str,
         limit: int = 10,
+        include_inactive: bool = False,
     ) -> list[Memory]:
+        """
+        Perform deterministic lexical memory search.
 
-        terms = [
-            term.strip().lower()
-            for term in query.split()
-            if term.strip()
-        ]
+        Ranking signals:
 
-        if not terms:
+            1. Exact phrase match
+            2. Exact content-token matches
+            3. Exact tag-token matches
+            4. Partial lexical matches
+            5. Query coverage
+            6. Importance
+            7. Confidence
+
+        By default, only ACTIVE memories participate.
+
+        This layer performs candidate discovery. The higher-level
+        MemoryRetriever may apply additional ranking afterward.
+        """
+
+        import re
+
+        query = query.strip()
+
+        if not query:
             return []
+
+        limit = max(
+            1,
+            int(limit),
+        )
+
+        normalized_query = query.lower()
+
+        # -----------------------------------------------------
+        # Tokenize query
+        # -----------------------------------------------------
+
+        def tokenize(text: str) -> list[str]:
+            return re.findall(
+                r"\b[a-z0-9_]+\b",
+                text.lower(),
+            )
+
+        query_tokens = {
+            token
+            for token in tokenize(
+                normalized_query
+            )
+            if len(token) >= 2
+        }
+
+        if not query_tokens:
+            return []
+
+        # -----------------------------------------------------
+        # Load eligible memories
+        # -----------------------------------------------------
 
         conn = self._connect()
 
+        sql = """
+        SELECT
+            id,
+            memory_type,
+            content,
+            importance,
+            confidence,
+            sensitivity,
+            source,
+            tags_json,
+            metadata_json,
+            status,
+            created_at,
+            updated_at,
+            stale_at,
+            archived_at,
+            superseded_by
+        FROM memories
+        """
+
+        params: list[object] = []
+
+        if not include_inactive:
+            sql += """
+            WHERE status = ?
+            """
+
+            params.append(
+                MemoryStatus.ACTIVE.value
+            )
+
         rows = conn.execute(
-            """
-            SELECT
-                id,
-                memory_type,
-                content,
-                importance,
-                confidence,
-                sensitivity,
-                source,
-                tags_json,
-                metadata_json,
-                created_at,
-                updated_at
-            FROM memories
-            """
+            sql,
+            params,
         ).fetchall()
 
         if self._connection is None:
             conn.close()
 
         memories = [
-            Memory.from_row(tuple(row))
+            Memory.from_row(
+                tuple(row)
+            )
             for row in rows
         ]
 
-        def score(
-            memory: Memory,
-        ) -> float:
+        # -----------------------------------------------------
+        # Score candidate
+        # -----------------------------------------------------
 
-            text = (
-                memory.content
-                + " "
-                + " ".join(memory.tags)
+        def score(memory: Memory) -> float:
+            content = memory.content.lower()
+            tags_text = " ".join(
+                memory.tags
             ).lower()
 
-            hits = sum(
-                1
-                for term in terms
-                if term in text
+            content_tokens = set(
+                tokenize(content)
             )
 
-            return (
-                hits * 2.0
-                + memory.importance
-                + memory.confidence
+            tag_tokens = set(
+                tokenize(tags_text)
             )
+
+            exact_content_hits = (
+                query_tokens
+                & content_tokens
+            )
+
+            exact_tag_hits = (
+                query_tokens
+                & tag_tokens
+            )
+
+            score_value = 0.0
+
+            # Exact complete phrase.
+            if normalized_query in content:
+                score_value += 12.0
+
+            # Exact token matches.
+            score_value += (
+                len(exact_content_hits)
+                * 4.0
+            )
+
+            score_value += (
+                len(exact_tag_hits)
+                * 3.0
+            )
+
+            # Partial lexical matches.
+            for term in query_tokens:
+                if term in content:
+                    score_value += 1.0
+
+                if term in tags_text:
+                    score_value += 0.5
+
+            # Query coverage.
+            matched_tokens = (
+                exact_content_hits
+                | exact_tag_hits
+            )
+
+            coverage = (
+                len(matched_tokens)
+                / len(query_tokens)
+            )
+
+            score_value += (
+                coverage * 4.0
+            )
+
+            # Memory quality signals.
+            score_value += (
+                memory.importance * 1.5
+            )
+
+            score_value += (
+                memory.confidence
+            )
+
+            return score_value
+
+        # -----------------------------------------------------
+        # Rank
+        # -----------------------------------------------------
 
         ranked = sorted(
             (
@@ -423,10 +749,13 @@ class SQLiteMemoryStore:
                 for memory in memories
                 if score(memory) > 0
             ),
-            key=score,
+            key=lambda memory: (
+                score(memory),
+                memory.importance,
+                memory.confidence,
+                memory.updated_at,
+            ),
             reverse=True,
         )
 
-        return ranked[
-            : max(1, int(limit))
-        ]
+        return ranked[:limit]

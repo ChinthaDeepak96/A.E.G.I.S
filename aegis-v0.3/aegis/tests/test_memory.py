@@ -1,4 +1,8 @@
-from memory import MemoryManager, MemoryType
+from memory import (
+    MemoryManager,
+    MemoryStatus,
+    MemoryType,
+)
 
 
 def test_memory_database_is_created(tmp_path):
@@ -208,3 +212,381 @@ def test_store_candidate_stores_new_memory(tmp_path):
     assert status == "stored"
     assert memory is not None
     assert len(manager.recent()) == 1
+
+def test_new_memory_starts_active():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "AEGIS starts with an active memory.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+    assert memory.status == MemoryStatus.ACTIVE
+
+
+def test_memory_can_be_marked_stale():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "Temporary AEGIS information.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    memory.mark_stale()
+    manager.store.save(memory)
+
+    stored = manager.get(memory.id)
+
+    assert stored is not None
+    assert stored.status == MemoryStatus.STALE
+    assert stored.stale_at is not None
+
+
+def test_memory_can_be_reactivated():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "Information that may become relevant again.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    memory.mark_stale()
+    manager.store.save(memory)
+
+    memory.activate()
+    manager.store.save(memory)
+
+    stored = manager.get(memory.id)
+
+    assert stored is not None
+    assert stored.status == MemoryStatus.ACTIVE
+    assert stored.stale_at is None
+
+
+def test_memory_can_be_archived():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "Old AEGIS information.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    memory.archive()
+    manager.store.save(memory)
+
+    stored = manager.get(memory.id)
+
+    assert stored is not None
+    assert stored.status == MemoryStatus.ARCHIVED
+    assert stored.archived_at is not None
+
+
+def test_memory_can_be_superseded():
+    manager = MemoryManager(":memory:")
+
+    old_memory = manager.remember(
+        "AEGIS uses an older model.",
+        importance=0.9,
+    )
+
+    new_memory = manager.remember(
+        "AEGIS now uses a newer model.",
+        importance=0.95,
+    )
+
+    assert old_memory is not None
+    assert new_memory is not None
+
+    old_memory.supersede(
+        new_memory.id
+    )
+
+    manager.store.save(
+        old_memory
+    )
+
+    stored = manager.get(
+        old_memory.id
+    )
+
+    assert stored is not None
+    assert stored.status == MemoryStatus.SUPERSEDED
+    assert stored.superseded_by == new_memory.id
+
+
+def test_recent_can_filter_by_status():
+    manager = MemoryManager(":memory:")
+
+    active = manager.remember(
+        "Active memory.",
+        importance=0.9,
+    )
+
+    stale = manager.remember(
+        "Stale memory.",
+        importance=0.9,
+    )
+
+    assert active is not None
+    assert stale is not None
+
+    stale.mark_stale()
+    manager.store.save(stale)
+
+    active_memories = manager.recent(
+        status=MemoryStatus.ACTIVE
+    )
+
+    stale_memories = manager.recent(
+        status=MemoryStatus.STALE
+    )
+
+    assert any(
+        m.id == active.id
+        for m in active_memories
+    )
+
+    assert not any(
+        m.id == stale.id
+        for m in active_memories
+    )
+
+    assert any(
+        m.id == stale.id
+        for m in stale_memories
+    )
+
+
+def test_stale_memory_is_not_returned_by_default_search():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "AEGIS uses lifecycle aware memory.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    memory.mark_stale()
+    manager.store.save(memory)
+
+    results = manager.recall(
+        "AEGIS lifecycle"
+    )
+
+    assert not any(
+        m.id == memory.id
+        for m in results
+    )
+
+
+def test_archived_memory_is_not_returned_by_default_search():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "Archived AEGIS information.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    memory.archive()
+    manager.store.save(memory)
+
+    results = manager.recall(
+        "Archived AEGIS information"
+    )
+
+    assert not any(
+        m.id == memory.id
+        for m in results
+    )
+
+def test_update_memory_changes_existing_memory():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "AEGIS uses Qwen 7B.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    updated = manager.update_memory(
+        memory.id,
+        "AEGIS uses Gemma 4.",
+    )
+
+    assert updated is not None
+    assert updated.id == memory.id
+    assert updated.content == "AEGIS uses Gemma 4."
+    assert updated.status == MemoryStatus.ACTIVE
+
+
+def test_update_memory_rejects_archived_memory():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "Old AEGIS configuration.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    memory.archive()
+    manager.store.save(memory)
+
+    result = manager.update_memory(
+        memory.id,
+        "New configuration.",
+    )
+
+    assert result is None
+
+
+def test_supersede_memory_creates_replacement():
+    manager = MemoryManager(":memory:")
+
+    old_memory = manager.remember(
+        "AEGIS uses Qwen 7B.",
+        importance=0.9,
+    )
+
+    assert old_memory is not None
+
+    old_id = old_memory.id
+
+    old, new = manager.supersede_memory(
+        old_id,
+        "AEGIS uses Gemma 4.",
+        importance=0.95,
+    )
+
+    assert old is not None
+    assert new is not None
+
+    assert old.id == old_id
+    assert old.status == MemoryStatus.SUPERSEDED
+    assert old.superseded_by == new.id
+
+    assert new.status == MemoryStatus.ACTIVE
+    assert (
+        new.metadata["supersedes_memory_id"]
+        == old.id
+    )
+
+
+def test_superseded_memory_is_not_returned_by_normal_recall():
+    manager = MemoryManager(":memory:")
+
+    old = manager.remember(
+        "AEGIS uses Qwen 7B.",
+        importance=0.9,
+    )
+
+    assert old is not None
+
+    old_id = old.id
+
+    manager.supersede_memory(
+        old_id,
+        "AEGIS uses Gemma 4.",
+        importance=0.95,
+    )
+
+    results = manager.recall(
+        "AEGIS uses model"
+    )
+
+    result_ids = {
+        memory.id
+        for memory in results
+    }
+
+    assert old_id not in result_ids
+
+
+def test_restore_memory_reactivates_stale_memory():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "AEGIS temporary information.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    memory.mark_stale()
+    manager.store.save(memory)
+
+    restored = manager.restore_memory(
+        memory.id
+    )
+
+    assert restored is not None
+    assert restored.status == MemoryStatus.ACTIVE
+
+
+def test_restore_memory_rejects_archived_memory():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "Archived AEGIS information.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    memory.archive()
+    manager.store.save(memory)
+
+    restored = manager.restore_memory(
+        memory.id
+    )
+
+    assert restored is None
+
+
+def test_archive_memory():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "Information no longer needed.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    archived = manager.archive_memory(
+        memory.id
+    )
+
+    assert archived is not None
+    assert archived.status == MemoryStatus.ARCHIVED
+    assert archived.archived_at is not None
+
+
+def test_stale_memory():
+    manager = MemoryManager(":memory:")
+
+    memory = manager.remember(
+        "Information becoming outdated.",
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    stale = manager.stale_memory(
+        memory.id
+    )
+
+    assert stale is not None
+    assert stale.status == MemoryStatus.STALE
+    assert stale.stale_at is not None

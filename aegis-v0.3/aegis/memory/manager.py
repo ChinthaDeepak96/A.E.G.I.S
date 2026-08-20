@@ -2,6 +2,7 @@
 A.E.G.I.S. Memory Manager.
 
 Provides the public API for:
+
 - Explicit memory storage
 - Automatic memory candidate storage
 - Memory retrieval
@@ -9,21 +10,43 @@ Provides the public API for:
 - Memory inspection
 - Memory deletion
 - Complete memory clearing
-- Basic duplicate detection
-- Memory formatting for the A.E.G.I.S. interface
+- Duplicate detection
+- Conflict detection
+- Conflict resolution
+- Memory consolidation
+- Memory lifecycle management
+- Memory updating
+- Memory supersession
+- Memory restoration
+- Memory archiving
 
-v0.4.2c adds:
-- Lexical similarity detection
-- Duplicate candidate detection
-- Governed automatic-memory storage
+The MemoryManager is the mutation boundary for persistent memory.
+
+The LLM and higher-level A.E.G.I.S. components should never
+write directly to SQLite.
 """
 
 from __future__ import annotations
 
 import re
 
-from .models import Memory, MemoryType
+from .conflicts import (
+    ConflictResult,
+    MemoryConflictDetector,
+    MemoryRelationship,
+)
+from .consolidation import MemoryConsolidator
+from .models import (
+    Memory,
+    MemoryStatus,
+    MemoryType,
+)
 from .policy import MemoryPolicy
+from .resolution import (
+    MemoryConflictResolver,
+    ResolutionAction,
+    ResolutionDecision,
+)
 from .retrieval import MemoryRetriever
 from .store import SQLiteMemoryStore
 
@@ -32,11 +55,19 @@ class MemoryManager:
     """
     Public API for A.E.G.I.S. persistent memory.
 
-    MemoryManager is the boundary between the rest of A.E.G.I.S.
-    and the underlying SQLite memory store.
+    MemoryManager coordinates:
 
-    The LLM should never write directly to SQLite.
-    All memory creation must pass through this class.
+        Policy
+            ↓
+        Memory construction
+            ↓
+        Consolidation
+            ↓
+        Conflict resolution
+            ↓
+        SQLite persistence
+
+    All memory mutations pass through this class.
     """
 
     def __init__(
@@ -44,7 +75,9 @@ class MemoryManager:
         database_path: str = "data/aegis_memory.db",
         policy: MemoryPolicy | None = None,
     ):
-        self.store = SQLiteMemoryStore(database_path)
+        self.store = SQLiteMemoryStore(
+            database_path
+        )
 
         self.policy = (
             policy
@@ -54,6 +87,19 @@ class MemoryManager:
 
         self.retriever = MemoryRetriever(
             self.store
+        )
+
+        self.conflict_detector = (
+            MemoryConflictDetector()
+        )
+
+        self.conflict_resolver = (
+            MemoryConflictResolver()
+        )
+
+        self.consolidator = MemoryConsolidator(
+            detector=self.conflict_detector,
+            resolver=self.conflict_resolver,
         )
 
     # =========================================================
@@ -76,12 +122,9 @@ class MemoryManager:
         """
         Store a memory after passing it through MemoryPolicy.
 
-        This is used for both explicit and controlled automatic
-        memory creation.
-
         Returns:
-            Memory object when stored.
-            None when rejected by policy or empty.
+            Memory when stored.
+            None when rejected or empty.
         """
 
         content = content.strip()
@@ -92,9 +135,15 @@ class MemoryManager:
         memory = Memory(
             content=content,
             memory_type=memory_type,
-            importance=self._clamp(importance),
-            confidence=self._clamp(confidence),
-            sensitivity=self._clamp(sensitivity),
+            importance=self._clamp(
+                importance
+            ),
+            confidence=self._clamp(
+                confidence
+            ),
+            sensitivity=self._clamp(
+                sensitivity
+            ),
             source=source,
             tags=tags or [],
             metadata=metadata or {},
@@ -106,7 +155,9 @@ class MemoryManager:
         ):
             return None
 
-        return self.store.save(memory)
+        return self.store.save(
+            memory
+        )
 
     # =========================================================
     # MEMORY RETRIEVAL
@@ -134,16 +185,16 @@ class MemoryManager:
     def recent(
         self,
         memory_type: MemoryType | None = None,
+        status: MemoryStatus | None = None,
         limit: int = 20,
     ) -> list[Memory]:
         """
-        Return recently stored memories.
-
-        Optionally filters by MemoryType.
+        Return recent memories with optional filters.
         """
 
         return self.store.list(
             memory_type=memory_type,
+            status=status,
             limit=limit,
         )
 
@@ -174,10 +225,6 @@ class MemoryManager:
     ) -> bool:
         """
         Delete one memory by ID.
-
-        Returns:
-            True if the memory was deleted.
-            False if no matching memory existed.
         """
 
         memory_id = memory_id.strip()
@@ -192,9 +239,6 @@ class MemoryManager:
     def clear(self) -> int:
         """
         Delete every stored memory.
-
-        Returns:
-            Number of deleted memories.
         """
 
         return self.store.clear()
@@ -220,6 +264,7 @@ class MemoryManager:
         return (
             f"Memory ID: {memory.id}\n"
             f"Type: {memory.memory_type.value}\n"
+            f"Status: {memory.status.value}\n"
             f"Content: {memory.content}\n"
             f"Importance: {memory.importance:.2f}\n"
             f"Confidence: {memory.confidence:.2f}\n"
@@ -227,7 +272,10 @@ class MemoryManager:
             f"Source: {memory.source}\n"
             f"Tags: {tags}\n"
             f"Created: {memory.created_at}\n"
-            f"Updated: {memory.updated_at}"
+            f"Updated: {memory.updated_at}\n"
+            f"Stale: {memory.stale_at}\n"
+            f"Archived: {memory.archived_at}\n"
+            f"Superseded By: {memory.superseded_by}"
         )
 
     def format_context(
@@ -236,7 +284,7 @@ class MemoryManager:
         limit: int = 8,
     ) -> str:
         """
-        Format relevant memories for injection into the LLM context.
+        Format relevant memories for LLM context injection.
         """
 
         memories = self.recall(
@@ -245,7 +293,9 @@ class MemoryManager:
         )
 
         if not memories:
-            return "No relevant memories were found."
+            return (
+                "No relevant memories were found."
+            )
 
         lines = [
             "Relevant A.E.G.I.S. memories:"
@@ -257,10 +307,12 @@ class MemoryManager:
                 f"{memory.content}"
             )
 
-        return "\n".join(lines)
+        return "\n".join(
+            lines
+        )
 
     # =========================================================
-    # DUPLICATE DETECTION
+    # DUPLICATE / SIMILARITY DETECTION
     # =========================================================
 
     @staticmethod
@@ -268,10 +320,7 @@ class MemoryManager:
         text: str,
     ) -> set[str]:
         """
-        Convert text into normalized tokens.
-
-        This is intentionally simple for v0.4.2c.
-        Semantic embeddings will be introduced later.
+        Convert text into normalized lexical tokens.
         """
 
         return {
@@ -291,13 +340,6 @@ class MemoryManager:
     ) -> float:
         """
         Calculate Jaccard token similarity.
-
-        Formula:
-
-            intersection / union
-
-        Returns:
-            Value between 0.0 and 1.0.
         """
 
         first_tokens = cls._normalize_text(
@@ -308,7 +350,10 @@ class MemoryManager:
             second
         )
 
-        if not first_tokens or not second_tokens:
+        if (
+            not first_tokens
+            or not second_tokens
+        ):
             return 0.0
 
         intersection = (
@@ -321,8 +366,9 @@ class MemoryManager:
             | second_tokens
         )
 
-        return len(intersection) / len(
-            union
+        return (
+            len(intersection)
+            / len(union)
         )
 
     def find_similar(
@@ -332,23 +378,7 @@ class MemoryManager:
         limit: int = 10,
     ) -> list[tuple[Memory, float]]:
         """
-        Find memories similar to a candidate.
-
-        Args:
-            content:
-                Candidate memory text.
-
-            threshold:
-                Minimum similarity required.
-
-            limit:
-                Maximum number of matches.
-
-        Returns:
-            List of:
-                (Memory, similarity_score)
-
-        Results are sorted from most similar to least similar.
+        Find active memories similar to a candidate.
         """
 
         content = content.strip()
@@ -357,7 +387,8 @@ class MemoryManager:
             return []
 
         memories = self.recent(
-            limit=1000
+            status=MemoryStatus.ACTIVE,
+            limit=1000,
         )
 
         matches: list[
@@ -386,58 +417,291 @@ class MemoryManager:
         return matches[:limit]
 
     # =========================================================
-    # AUTOMATIC MEMORY GOVERNANCE
+    # CONFLICT DETECTION
     # =========================================================
 
-    def store_candidate(
+    def detect_conflict(
         self,
         content: str,
-        memory_type: MemoryType,
         *,
-        importance: float,
-        confidence: float,
-        sensitivity: float,
-        source: str = "automatic_extraction",
+        memory_type: MemoryType = MemoryType.EPISODIC,
+        importance: float = 0.5,
+        confidence: float = 1.0,
+        sensitivity: float = 0.0,
+        source: str = "conflict_detection",
         tags: list[str] | None = None,
-    ) -> tuple[str, Memory | None]:
+    ) -> list[
+        tuple[
+            Memory,
+            ConflictResult,
+        ]
+    ]:
         """
-        Process an automatically extracted memory candidate.
+        Compare a candidate against active memories.
 
-        The candidate passes through:
+        Only DUPLICATE and CONFLICT relationships are returned.
 
-            Candidate
-                ↓
-            Duplicate check
-                ↓
-            MemoryPolicy
-                ↓
-            MemoryManager.remember()
-                ↓
-            SQLite
-
-        Returns:
-
-            ("stored", Memory)
-                Candidate was accepted and stored.
-
-            ("duplicate", Memory)
-                Candidate matched an existing memory.
-
-            ("rejected", None)
-                Candidate failed MemoryPolicy.
+        This method does not modify memory.
         """
 
         content = content.strip()
 
         if not content:
+            return []
+
+        candidate = Memory(
+            content=content,
+            memory_type=memory_type,
+            importance=self._clamp(
+                importance
+            ),
+            confidence=self._clamp(
+                confidence
+            ),
+            sensitivity=self._clamp(
+                sensitivity
+            ),
+            source=source,
+            tags=tags or [],
+        )
+
+        active_memories = self.recent(
+            status=MemoryStatus.ACTIVE,
+            limit=1000,
+        )
+
+        results: list[
+            tuple[
+                Memory,
+                ConflictResult,
+            ]
+        ] = []
+
+        for existing in active_memories:
+            result = (
+                self.conflict_detector.compare(
+                    existing,
+                    candidate,
+                )
+            )
+
+            if result.relationship in {
+                MemoryRelationship.DUPLICATE,
+                MemoryRelationship.CONFLICT,
+            }:
+                results.append(
+                    (
+                        existing,
+                        result,
+                    )
+                )
+
+        results.sort(
+            key=lambda item: item[1].score,
+            reverse=True,
+        )
+
+        return results
+
+    # =========================================================
+    # CONFLICT / RESOLUTION
+    # =========================================================
+
+    def apply_resolution(
+        self,
+        decision: ResolutionDecision,
+        *,
+        approve_destructive: bool = False,
+        memory_type: MemoryType = MemoryType.EPISODIC,
+        importance: float = 0.5,
+        confidence: float = 1.0,
+        sensitivity: float = 0.0,
+        source: str = "memory_resolution",
+        tags: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> tuple[
+        Memory | None,
+        Memory | None,
+    ]:
+        """
+        Apply an already-created resolution decision.
+
+        Returns:
+
+            (existing_memory, resulting_memory)
+
+        SUPERSEDE_EXISTING requires explicit approval.
+        """
+
+        # -----------------------------------------------------
+        # REJECT
+        # -----------------------------------------------------
+
+        if (
+            decision.action
+            == ResolutionAction.REJECT_CANDIDATE
+        ):
+            existing = None
+
+            if decision.existing_memory_id:
+                existing = self.get(
+                    decision.existing_memory_id
+                )
+
             return (
-                "rejected",
+                existing,
                 None,
             )
 
         # -----------------------------------------------------
-        # 1. Clamp model-generated scores.
+        # KEEP EXISTING
         # -----------------------------------------------------
+
+        if (
+            decision.action
+            == ResolutionAction.KEEP_EXISTING
+        ):
+            existing = None
+
+            if decision.existing_memory_id:
+                existing = self.get(
+                    decision.existing_memory_id
+                )
+
+            return (
+                existing,
+                existing,
+            )
+
+        # -----------------------------------------------------
+        # KEEP BOTH
+        # -----------------------------------------------------
+
+        if (
+            decision.action
+            == ResolutionAction.KEEP_BOTH
+        ):
+            stored = self.remember(
+                decision.candidate_content,
+                memory_type=memory_type,
+                importance=importance,
+                confidence=confidence,
+                sensitivity=sensitivity,
+                source=source,
+                tags=tags,
+                metadata=metadata,
+                explicit=False,
+            )
+
+            return (
+                None,
+                stored,
+            )
+
+        # -----------------------------------------------------
+        # SUPERSEDE
+        # -----------------------------------------------------
+
+        if (
+            decision.action
+            == ResolutionAction.SUPERSEDE_EXISTING
+        ):
+            existing = None
+
+            if decision.existing_memory_id:
+                existing = self.get(
+                    decision.existing_memory_id
+                )
+
+            if not approve_destructive:
+                return (
+                    existing,
+                    None,
+                )
+
+            if not decision.existing_memory_id:
+                return (
+                    None,
+                    None,
+                )
+
+            old_memory, new_memory = (
+                self.supersede_memory(
+                    decision.existing_memory_id,
+                    decision.candidate_content,
+                    memory_type=memory_type,
+                    importance=importance,
+                    confidence=confidence,
+                    sensitivity=sensitivity,
+                    source=source,
+                    tags=tags,
+                    metadata=metadata,
+                )
+            )
+
+            return (
+                old_memory,
+                new_memory,
+            )
+
+        return (
+            None,
+            None,
+        )
+
+    def resolve_candidate(
+        self,
+        content: str,
+        memory_type: MemoryType = MemoryType.EPISODIC,
+        *,
+        importance: float = 0.5,
+        confidence: float = 1.0,
+        sensitivity: float = 0.0,
+        source: str = "automatic_extraction",
+        tags: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> tuple[
+        ResolutionDecision,
+        Memory | None,
+    ]:
+        """
+        Resolve and optionally store an automatically generated
+        memory candidate.
+
+        Pipeline:
+
+            Candidate
+                ↓
+            Governance
+                ↓
+            Consolidation
+                ↓
+            Resolution
+                ↓
+            Application
+        """
+
+        content = content.strip()
+
+        # -----------------------------------------------------
+        # Empty candidate
+        # -----------------------------------------------------
+
+        if not content:
+            return (
+                ResolutionDecision(
+                    action=ResolutionAction.REJECT_CANDIDATE,
+                    existing_memory_id=None,
+                    candidate_content="",
+                    relationship=MemoryRelationship.UNRELATED,
+                    confidence=0.0,
+                    reason=(
+                        "The candidate memory is empty."
+                    ),
+                    requires_confirmation=False,
+                ),
+                None,
+            )
 
         importance = self._clamp(
             importance
@@ -452,75 +716,520 @@ class MemoryManager:
         )
 
         # -----------------------------------------------------
-        # Automatic sensitivity gate.
-        #
-        # Automatically extracted sensitive information must
-        # never be silently persisted.
-        #
-        # Explicit /memory remember commands use remember()
-        # directly and therefore do not come through this path.
+        # Sensitive candidate
         # -----------------------------------------------------
 
         if sensitivity > 0:
+            return (
+                ResolutionDecision(
+                    action=ResolutionAction.REJECT_CANDIDATE,
+                    existing_memory_id=None,
+                    candidate_content=content,
+                    relationship=MemoryRelationship.UNRELATED,
+                    confidence=confidence,
+                    reason=(
+                        "The candidate contains sensitive "
+                        "information and was rejected by the "
+                        "automatic memory policy."
+                    ),
+                    requires_confirmation=True,
+                ),
+                None,
+            )
+
+        # -----------------------------------------------------
+        # Build candidate
+        # -----------------------------------------------------
+
+        candidate = Memory(
+            content=content,
+            memory_type=memory_type,
+            importance=importance,
+            confidence=confidence,
+            sensitivity=sensitivity,
+            source=source,
+            tags=tags or [],
+            metadata=metadata or {},
+        )
+
+        # -----------------------------------------------------
+        # Retrieve active memories
+        # -----------------------------------------------------
+
+        active_memories = self.recent(
+            status=MemoryStatus.ACTIVE,
+            limit=1000,
+        )
+
+        # -----------------------------------------------------
+        # Consolidate
+        # -----------------------------------------------------
+
+        proposal = self.consolidator.consolidate(
+            candidate,
+            active_memories,
+            allow_supersession=False,
+        )
+
+        decision = proposal.decision
+
+        # -----------------------------------------------------
+        # Apply decision
+        # -----------------------------------------------------
+
+        existing, resulting = (
+            self.apply_resolution(
+                decision,
+                approve_destructive=False,
+                memory_type=memory_type,
+                importance=importance,
+                confidence=confidence,
+                sensitivity=sensitivity,
+                source=source,
+                tags=tags,
+                metadata=metadata,
+            )
+        )
+
+        # -----------------------------------------------------
+        # REJECT
+        # -----------------------------------------------------
+
+        if (
+            decision.action
+            == ResolutionAction.REJECT_CANDIDATE
+        ):
+            return (
+                decision,
+                existing,
+            )
+
+        # -----------------------------------------------------
+        # KEEP EXISTING
+        # -----------------------------------------------------
+
+        if (
+            decision.action
+            == ResolutionAction.KEEP_EXISTING
+        ):
+            return (
+                decision,
+                existing,
+            )
+
+        # -----------------------------------------------------
+        # KEEP BOTH
+        # -----------------------------------------------------
+
+        if (
+            decision.action
+            == ResolutionAction.KEEP_BOTH
+        ):
+            if resulting is None:
+                rejected = ResolutionDecision(
+                    action=ResolutionAction.REJECT_CANDIDATE,
+                    existing_memory_id=(
+                        proposal.existing_memory.id
+                        if proposal.existing_memory
+                        is not None
+                        else None
+                    ),
+                    candidate_content=content,
+                    relationship=decision.relationship,
+                    confidence=decision.confidence,
+                    reason=(
+                        "The consolidator allowed the "
+                        "candidate, but MemoryPolicy rejected "
+                        "it during storage."
+                    ),
+                    requires_confirmation=False,
+                )
+
+                return (
+                    rejected,
+                    None,
+                )
+
+            return (
+                decision,
+                resulting,
+            )
+
+        # -----------------------------------------------------
+        # SUPERSEDE
+        # -----------------------------------------------------
+
+        return (
+            decision,
+            existing,
+        )
+
+    # =========================================================
+    # LEGACY AUTOMATIC CANDIDATE API
+    # =========================================================
+
+    def store_candidate(
+        self,
+        content: str,
+        memory_type: MemoryType,
+        *,
+        importance: float,
+        confidence: float,
+        sensitivity: float,
+        source: str = "automatic_extraction",
+        tags: list[str] | None = None,
+    ) -> tuple[
+        str,
+        Memory | None,
+    ]:
+        """
+        Process an automatically extracted memory candidate.
+
+        Returns:
+
+            ("stored", Memory)
+            ("duplicate", existing_memory)
+            ("conflict", existing_memory)
+            ("rejected", None)
+
+        This method is retained for backward compatibility.
+        New integrations should prefer resolve_candidate().
+        """
+
+        decision, memory = (
+            self.resolve_candidate(
+                content,
+                memory_type=memory_type,
+                importance=importance,
+                confidence=confidence,
+                sensitivity=sensitivity,
+                source=source,
+                tags=tags,
+            )
+        )
+
+        if (
+            decision.action
+            == ResolutionAction.REJECT_CANDIDATE
+        ):
+            if (
+                decision.relationship
+                == MemoryRelationship.DUPLICATE
+            ):
+                return (
+                    "duplicate",
+                    memory,
+                )
+
+            if (
+                decision.relationship
+                == MemoryRelationship.CONFLICT
+            ):
+                return (
+                    "conflict",
+                    memory,
+                )
+
             return (
                 "rejected",
                 None,
             )
 
-        # -----------------------------------------------------
-        # 2. Check for an existing memory.
-        # -----------------------------------------------------
-
-        similar = self.find_similar(
-            content,
-            threshold=0.60,
-        )
-
-        if similar:
-            existing, similarity = (
-                similar[0]
+        if (
+            decision.action
+            == ResolutionAction.KEEP_EXISTING
+        ):
+            return (
+                "conflict",
+                memory,
             )
 
-            # Strong similarity means this is probably
-            # the same piece of information.
-            if similarity >= 0.80:
-                return (
-                    "duplicate",
-                    existing,
-                )
+        if memory is not None:
+            return (
+                "stored",
+                memory,
+            )
 
-        # -----------------------------------------------------
-        # 3. Send the candidate through the normal policy.
-        # -----------------------------------------------------
+        return (
+            "rejected",
+            None,
+        )
 
-        memory = self.remember(
-            content,
+    # =========================================================
+    # MEMORY LIFECYCLE / UPDATES
+    # =========================================================
+
+    def update_memory(
+        self,
+        memory_id: str,
+        content: str,
+        *,
+        importance: float | None = None,
+        confidence: float | None = None,
+        sensitivity: float | None = None,
+        tags: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> Memory | None:
+        """
+        Update an existing memory in place.
+        """
+
+        memory_id = memory_id.strip()
+        content = content.strip()
+
+        if not memory_id or not content:
+            return None
+
+        memory = self.get(
+            memory_id
+        )
+
+        if memory is None:
+            return None
+
+        if memory.status in {
+            MemoryStatus.ARCHIVED,
+            MemoryStatus.SUPERSEDED,
+        }:
+            return None
+
+        memory.content = content
+
+        if importance is not None:
+            memory.importance = self._clamp(
+                importance
+            )
+
+        if confidence is not None:
+            memory.confidence = self._clamp(
+                confidence
+            )
+
+        if sensitivity is not None:
+            memory.sensitivity = self._clamp(
+                sensitivity
+            )
+
+        if tags is not None:
+            memory.tags = list(tags)
+
+        if metadata is not None:
+            memory.metadata = dict(
+                metadata
+            )
+
+        memory.activate()
+
+        return self.store.save(
+            memory
+        )
+
+    def supersede_memory(
+        self,
+        old_memory_id: str,
+        new_content: str,
+        *,
+        memory_type: MemoryType | None = None,
+        importance: float = 0.5,
+        confidence: float = 1.0,
+        sensitivity: float = 0.0,
+        source: str = "memory_update",
+        tags: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> tuple[
+        Memory | None,
+        Memory | None,
+    ]:
+        """
+        Replace an existing memory while preserving history.
+        """
+
+        old_memory_id = (
+            old_memory_id.strip()
+        )
+
+        new_content = (
+            new_content.strip()
+        )
+
+        if (
+            not old_memory_id
+            or not new_content
+        ):
+            return (
+                None,
+                None,
+            )
+
+        old_memory = self.get(
+            old_memory_id
+        )
+
+        if old_memory is None:
+            return (
+                None,
+                None,
+            )
+
+        if (
+            old_memory.status
+            != MemoryStatus.ACTIVE
+        ):
+            return (
+                None,
+                None,
+            )
+
+        importance = self._clamp(
+            importance
+        )
+
+        confidence = self._clamp(
+            confidence
+        )
+
+        sensitivity = self._clamp(
+            sensitivity
+        )
+
+        replacement_metadata = dict(
+            metadata or {}
+        )
+
+        replacement_metadata[
+            "supersedes_memory_id"
+        ] = old_memory.id
+
+        if memory_type is None:
+            memory_type = (
+                old_memory.memory_type
+            )
+
+        new_memory = self.remember(
+            new_content,
             memory_type=memory_type,
             importance=importance,
             confidence=confidence,
             sensitivity=sensitivity,
             source=source,
             tags=tags,
+            metadata=replacement_metadata,
             explicit=False,
         )
 
-        # -----------------------------------------------------
-        # 4. Policy rejected the candidate.
-        # -----------------------------------------------------
-
-        if memory is None:
+        if new_memory is None:
             return (
-                "rejected",
+                None,
                 None,
             )
 
-        # -----------------------------------------------------
-        # 5. Candidate successfully stored.
-        # -----------------------------------------------------
+        old_memory.supersede(
+            new_memory.id
+        )
+
+        self.store.save(
+            old_memory
+        )
 
         return (
-            "stored",
-            memory,
+            old_memory,
+            new_memory,
+        )
+
+    def restore_memory(
+        self,
+        memory_id: str,
+    ) -> Memory | None:
+        """
+        Reactivate a stale memory.
+        """
+
+        memory_id = memory_id.strip()
+
+        if not memory_id:
+            return None
+
+        memory = self.get(
+            memory_id
+        )
+
+        if memory is None:
+            return None
+
+        if (
+            memory.status
+            != MemoryStatus.STALE
+        ):
+            return None
+
+        memory.activate()
+
+        return self.store.save(
+            memory
+        )
+
+    def archive_memory(
+        self,
+        memory_id: str,
+    ) -> Memory | None:
+        """
+        Archive a memory while retaining it in storage.
+        """
+
+        memory_id = memory_id.strip()
+
+        if not memory_id:
+            return None
+
+        memory = self.get(
+            memory_id
+        )
+
+        if memory is None:
+            return None
+
+        if memory.status in {
+            MemoryStatus.ARCHIVED,
+            MemoryStatus.SUPERSEDED,
+        }:
+            return None
+
+        memory.archive()
+
+        return self.store.save(
+            memory
+        )
+
+    def stale_memory(
+        self,
+        memory_id: str,
+    ) -> Memory | None:
+        """
+        Mark an active memory as stale.
+        """
+
+        memory_id = memory_id.strip()
+
+        if not memory_id:
+            return None
+
+        memory = self.get(
+            memory_id
+        )
+
+        if memory is None:
+            return None
+
+        if (
+            memory.status
+            != MemoryStatus.ACTIVE
+        ):
+            return None
+
+        memory.mark_stale()
+
+        return self.store.save(
+            memory
         )
 
     # =========================================================
