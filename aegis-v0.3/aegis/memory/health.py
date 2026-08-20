@@ -3,20 +3,20 @@ A.E.G.I.S. Memory Health.
 
 Provides a deterministic, read-only assessment of memory health.
 
-This module does NOT modify memories or the database.
-
-Health is calculated from currently available memory signals:
+Health is calculated from:
 
     - lifecycle status
     - age
     - importance
     - confidence
+    - retrieval usage
+    - access usage
+    - time since last retrieval
     - staleness metadata
     - archival metadata
     - supersession metadata
 
-The purpose of this module is to identify memories that may
-require future maintenance.
+This module does NOT modify memories or the database.
 
 Actual lifecycle mutations remain the responsibility of
 MemoryManager.
@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from .models import Memory, MemoryStatus
+from .usage import MemoryUsage
 
 
 class MemoryHealth(str, Enum):
@@ -48,7 +49,7 @@ class MemoryHealth(str, Enum):
 @dataclass(frozen=True)
 class MemoryHealthReport:
     """
-    Immutable health report for a single memory.
+    Immutable health report for one memory.
 
     The report contains observations and recommendations only.
 
@@ -73,6 +74,14 @@ class MemoryHealthReport:
 
     superseded: bool
 
+    retrieval_count: int
+
+    access_count: int
+
+    days_since_retrieval: float | None
+
+    has_been_retrieved: bool
+
     health_score: float
 
     reason: str
@@ -80,9 +89,9 @@ class MemoryHealthReport:
 
 class MemoryHealthAnalyzer:
     """
-    Deterministic first-generation memory health analyzer.
+    Deterministic memory health analyzer.
 
-    Conservative defaults:
+    Conservative classification rules:
 
         ACTIVE + recent + reliable
             -> HEALTHY
@@ -99,6 +108,14 @@ class MemoryHealthAnalyzer:
         ARCHIVED / SUPERSEDED
             -> ARCHIVAL_CANDIDATE
 
+    Usage affects the continuous health score.
+
+    Frequent and recent retrieval improves health.
+
+    Lack of retrieval lowers health.
+
+    Usage does not override lifecycle status.
+
     This class never modifies a Memory.
     """
 
@@ -112,6 +129,29 @@ class MemoryHealthAnalyzer:
 
     DEFAULT_ARCHIVAL_CONFIDENCE = 0.20
 
+    # ---------------------------------------------------------
+    # Health score weights.
+    #
+    # These affect the continuous score only.
+    # Classification remains deterministic.
+    # ---------------------------------------------------------
+
+    IMPORTANCE_WEIGHT = 0.25
+
+    CONFIDENCE_WEIGHT = 0.40
+
+    FRESHNESS_WEIGHT = 0.25
+
+    USAGE_WEIGHT = 0.10
+
+    # ---------------------------------------------------------
+    # Usage scoring.
+    # ---------------------------------------------------------
+
+    DEFAULT_USAGE_HALF_LIFE_DAYS = 30.0
+
+    DEFAULT_RETRIEVAL_SATURATION = 10
+
     def __init__(
         self,
         *,
@@ -123,6 +163,12 @@ class MemoryHealthAnalyzer:
         ),
         archival_confidence: float = (
             DEFAULT_ARCHIVAL_CONFIDENCE
+        ),
+        usage_half_life_days: float = (
+            DEFAULT_USAGE_HALF_LIFE_DAYS
+        ),
+        retrieval_saturation: int = (
+            DEFAULT_RETRIEVAL_SATURATION
         ),
     ):
         if aging_days < 0:
@@ -140,6 +186,16 @@ class MemoryHealthAnalyzer:
             raise ValueError(
                 "archival_days must be greater than or equal "
                 "to stale_days"
+            )
+
+        if usage_half_life_days <= 0:
+            raise ValueError(
+                "usage_half_life_days must be greater than zero"
+            )
+
+        if retrieval_saturation <= 0:
+            raise ValueError(
+                "retrieval_saturation must be greater than zero"
             )
 
         self.aging_days = float(
@@ -162,6 +218,14 @@ class MemoryHealthAnalyzer:
             archival_confidence
         )
 
+        self.usage_half_life_days = float(
+            usage_half_life_days
+        )
+
+        self.retrieval_saturation = int(
+            retrieval_saturation
+        )
+
     # =========================================================
     # PUBLIC API
     # =========================================================
@@ -170,12 +234,13 @@ class MemoryHealthAnalyzer:
         self,
         memory: Memory,
         *,
+        usage: MemoryUsage | None = None,
         now: datetime | None = None,
     ) -> MemoryHealthReport:
         """
         Analyze one memory.
 
-        The memory is never modified.
+        The memory and usage objects are never modified.
         """
 
         if not isinstance(
@@ -184,6 +249,14 @@ class MemoryHealthAnalyzer:
         ):
             raise TypeError(
                 "memory must be a Memory instance"
+            )
+
+        if usage is not None and not isinstance(
+            usage,
+            MemoryUsage,
+        ):
+            raise TypeError(
+                "usage must be a MemoryUsage instance"
             )
 
         current_time = (
@@ -217,18 +290,56 @@ class MemoryHealthAnalyzer:
             confidence,
         )
 
+        usage_snapshot = (
+            usage
+            if usage is not None
+            else MemoryUsage()
+        )
+
+        retrieval_count = max(
+            0,
+            int(
+                usage_snapshot.retrieval_count
+            ),
+        )
+
+        access_count = max(
+            0,
+            int(
+                usage_snapshot.access_count
+            ),
+        )
+
+        days_since_retrieval = (
+            usage_snapshot.days_since_retrieval(
+                now=current_time
+            )
+        )
+
+        has_been_retrieved = (
+            usage_snapshot.has_been_retrieved()
+        )
+
         health_score = self._health_score(
-            memory,
-            age_days,
-            importance,
-            confidence,
+            memory=memory,
+            age_days=age_days,
+            importance=importance,
+            confidence=confidence,
+            usage=usage_snapshot,
+            days_since_retrieval=(
+                days_since_retrieval
+            ),
         )
 
         reason = self._reason(
-            memory,
-            health,
-            age_days,
-            confidence,
+            memory=memory,
+            health=health,
+            age_days=age_days,
+            confidence=confidence,
+            usage=usage_snapshot,
+            days_since_retrieval=(
+                days_since_retrieval
+            ),
         )
 
         return MemoryHealthReport(
@@ -250,6 +361,14 @@ class MemoryHealthAnalyzer:
                 memory.status
                 == MemoryStatus.SUPERSEDED
             ),
+            retrieval_count=retrieval_count,
+            access_count=access_count,
+            days_since_retrieval=(
+                days_since_retrieval
+            ),
+            has_been_retrieved=(
+                has_been_retrieved
+            ),
             health_score=health_score,
             reason=reason,
         )
@@ -258,17 +377,29 @@ class MemoryHealthAnalyzer:
         self,
         memories: list[Memory],
         *,
+        usages: dict[str, MemoryUsage] | None = None,
         now: datetime | None = None,
     ) -> list[MemoryHealthReport]:
         """
         Analyze multiple memories.
 
-        Results preserve the input order.
+        Results preserve input order.
+
+        `usages` maps memory IDs to MemoryUsage objects.
         """
+
+        usage_map = (
+            usages
+            if usages is not None
+            else {}
+        )
 
         return [
             self.analyze(
                 memory,
+                usage=usage_map.get(
+                    memory.id
+                ),
                 now=now,
             )
             for memory in memories
@@ -278,6 +409,7 @@ class MemoryHealthAnalyzer:
         self,
         memory: Memory,
         *,
+        usage: MemoryUsage | None = None,
         now: datetime | None = None,
     ) -> MemoryHealth:
         """
@@ -286,6 +418,7 @@ class MemoryHealthAnalyzer:
 
         return self.analyze(
             memory,
+            usage=usage,
             now=now,
         ).health
 
@@ -303,26 +436,14 @@ class MemoryHealthAnalyzer:
         Determine deterministic health state.
         """
 
-        # -----------------------------------------------------
-        # Already archived or superseded.
-        # -----------------------------------------------------
-
         if memory.status in {
             MemoryStatus.ARCHIVED,
             MemoryStatus.SUPERSEDED,
         }:
             return MemoryHealth.ARCHIVAL_CANDIDATE
 
-        # -----------------------------------------------------
-        # Explicitly stale.
-        # -----------------------------------------------------
-
         if memory.status == MemoryStatus.STALE:
             return MemoryHealth.ARCHIVAL_CANDIDATE
-
-        # -----------------------------------------------------
-        # Active memories with very weak confidence.
-        # -----------------------------------------------------
 
         if (
             confidence
@@ -335,10 +456,6 @@ class MemoryHealthAnalyzer:
             <= self.stale_confidence
         ):
             return MemoryHealth.STALE_CANDIDATE
-
-        # -----------------------------------------------------
-        # Age-based classification.
-        # -----------------------------------------------------
 
         if (
             age_days
@@ -366,10 +483,13 @@ class MemoryHealthAnalyzer:
 
     def _health_score(
         self,
+        *,
         memory: Memory,
         age_days: float,
         importance: float,
         confidence: float,
+        usage: MemoryUsage,
+        days_since_retrieval: float | None,
     ) -> float:
         """
         Calculate a continuous health score.
@@ -378,9 +498,12 @@ class MemoryHealthAnalyzer:
 
         Components:
 
-            importance  30%
-            confidence  40%
-            freshness   30%
+            importance  25%
+            confidence  35%
+            freshness   20%
+            usage       20%
+
+        Lifecycle state can impose a hard ceiling.
         """
 
         if memory.status in {
@@ -390,6 +513,7 @@ class MemoryHealthAnalyzer:
             return 0.0
 
         if memory.status == MemoryStatus.STALE:
+
             return min(
                 0.25,
                 confidence * 0.5,
@@ -399,14 +523,105 @@ class MemoryHealthAnalyzer:
             age_days
         )
 
+        usage_score = self._usage_score(
+            usage,
+            days_since_retrieval,
+        )
+
         score = (
-            importance * 0.30
-            + confidence * 0.40
-            + freshness * 0.30
+            importance
+            * self.IMPORTANCE_WEIGHT
+            + confidence
+            * self.CONFIDENCE_WEIGHT
+            + freshness
+            * self.FRESHNESS_WEIGHT
+            + usage_score
+            * self.USAGE_WEIGHT
         )
 
         return self._clamp(
             score
+        )
+
+    def _usage_score(
+        self,
+        usage: MemoryUsage,
+        days_since_retrieval: float | None,
+    ) -> float:
+        """
+        Calculate usage health.
+
+        A memory that has never been retrieved receives 0.
+
+        Retrieved memories gain a score based on:
+
+            - retrieval frequency
+            - retrieval recency
+        """
+
+        retrieval_count = max(
+            0,
+            int(
+                usage.retrieval_count
+            ),
+        )
+
+        if retrieval_count <= 0:
+            return 0.0
+
+        frequency = self._clamp(
+            retrieval_count
+            / self.retrieval_saturation
+        )
+
+        if days_since_retrieval is None:
+            recency = 0.0
+
+        else:
+            recency = self._decay(
+                days_since_retrieval,
+                self.usage_half_life_days,
+            )
+
+        # -----------------------------------------------------
+        # Frequency and recency both matter.
+        #
+        # A frequently used memory can remain useful even when
+        # its latest access was not extremely recent.
+        # -----------------------------------------------------
+
+        return self._clamp(
+            0.60 * frequency
+            + 0.40 * recency
+        )
+
+    @staticmethod
+    def _decay(
+        age_days: float,
+        half_life_days: float,
+    ) -> float:
+        """
+        Exponential half-life decay.
+        """
+
+        if age_days <= 0:
+            return 1.0
+
+        if half_life_days <= 0:
+            return 0.0
+
+        import math
+
+        return max(
+            0.0,
+            min(
+                1.0,
+                math.pow(
+                    0.5,
+                    age_days
+                    / half_life_days,
+                ),
+            ),
         )
 
     def _freshness_score(
@@ -414,7 +629,7 @@ class MemoryHealthAnalyzer:
         age_days: float,
     ) -> float:
         """
-        Convert memory age into a freshness score.
+        Convert memory age into freshness.
 
         Fresh memories approach 1.0.
 
@@ -442,53 +657,18 @@ class MemoryHealthAnalyzer:
         )
 
     # =========================================================
-    # AGE
-    # =========================================================
-
-    @staticmethod
-    def _age_days(
-        memory: Memory,
-        now: datetime,
-    ) -> float:
-        """
-        Calculate memory age.
-
-        updated_at is used because the memory may have been
-        refreshed after creation.
-        """
-
-        timestamp = (
-            memory.updated_at
-            or memory.created_at
-        )
-
-        parsed = (
-            MemoryHealthAnalyzer
-            ._parse_datetime(timestamp)
-        )
-
-        if parsed is None:
-            return 0.0
-
-        age = (
-            now - parsed
-        ).total_seconds()
-
-        return max(
-            0.0,
-            age / 86400.0,
-        )
-
-    # =========================================================
     # REASONS
     # =========================================================
 
     @staticmethod
     def _reason(
+        *,
         memory: Memory,
         health: MemoryHealth,
         age_days: float,
         confidence: float,
+        usage: MemoryUsage,
+        days_since_retrieval: float | None,
     ) -> str:
         """
         Generate a deterministic human-readable explanation.
@@ -498,15 +678,29 @@ class MemoryHealthAnalyzer:
             health
             == MemoryHealth.HEALTHY
         ):
+            if usage.has_been_retrieved():
+                return (
+                    "The memory is active, sufficiently "
+                    "recent, reliable, and has demonstrated "
+                    "retrieval usage."
+                )
+
             return (
-                "The memory is active, sufficiently "
-                "recent, and has adequate confidence."
+                "The memory is active, sufficiently recent, "
+                "and has adequate confidence."
             )
 
         if (
             health
             == MemoryHealth.AGING
         ):
+            if usage.has_been_retrieved():
+                return (
+                    "The memory remains active but has aged "
+                    "past the configured aging threshold; "
+                    "retrieval activity indicates continued use."
+                )
+
             return (
                 "The memory remains active but has aged "
                 "past the configured aging threshold."
@@ -525,9 +719,18 @@ class MemoryHealthAnalyzer:
                     "should be considered for staleness review."
                 )
 
+            if usage.has_been_retrieved():
+                return (
+                    "The memory has remained active beyond "
+                    "the configured staleness threshold, "
+                    "but retrieval activity indicates that "
+                    "it may still be useful."
+                )
+
             return (
                 "The memory has remained active beyond the "
-                "configured staleness threshold."
+                "configured staleness threshold without "
+                "recorded retrieval activity."
             )
 
         if (
@@ -560,6 +763,44 @@ class MemoryHealthAnalyzer:
         return (
             "The memory has reached the configured archival "
             "threshold or has critically low confidence."
+        )
+
+    # =========================================================
+    # AGE
+    # =========================================================
+
+    @staticmethod
+    def _age_days(
+        memory: Memory,
+        now: datetime,
+    ) -> float:
+        """
+        Calculate memory age.
+
+        updated_at is preferred because a memory may have been
+        refreshed after creation.
+        """
+
+        timestamp = (
+            memory.updated_at
+            or memory.created_at
+        )
+
+        parsed = (
+            MemoryHealthAnalyzer
+            ._parse_datetime(timestamp)
+        )
+
+        if parsed is None:
+            return 0.0
+
+        age = (
+            now - parsed
+        ).total_seconds()
+
+        return max(
+            0.0,
+            age / 86400.0,
         )
 
     # =========================================================

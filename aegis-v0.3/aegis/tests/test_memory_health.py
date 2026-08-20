@@ -362,3 +362,372 @@ def test_invalid_threshold_order_is_rejected():
         assert False
     except ValueError:
         pass
+
+def test_never_retrieved_memory_has_zero_usage_score():
+    analyzer = MemoryHealthAnalyzer()
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    memory = Memory(
+        "Unused memory.",
+        importance=0.8,
+        confidence=0.9,
+        created_at=now.isoformat(),
+        updated_at=now.isoformat(),
+    )
+
+    from memory.usage import MemoryUsage
+
+    usage = MemoryUsage()
+
+    report = analyzer.analyze(
+        memory,
+        usage=usage,
+        now=now,
+    )
+
+    assert (
+        report.retrieval_count
+        == 0
+    )
+
+    assert (
+        report.access_count
+        == 0
+    )
+
+    assert (
+        report.has_been_retrieved
+        is False
+    )
+
+    assert (
+        report.days_since_retrieval
+        is None
+    )
+
+
+def test_retrieved_memory_reports_usage():
+    analyzer = MemoryHealthAnalyzer()
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    memory = Memory(
+        "Frequently used memory.",
+        importance=0.8,
+        confidence=0.9,
+        created_at=now.isoformat(),
+        updated_at=now.isoformat(),
+    )
+
+    from memory.usage import MemoryUsage
+
+    usage = MemoryUsage()
+
+    usage.record_retrieval(
+        timestamp=now
+    )
+
+    usage.record_retrieval(
+        timestamp=now
+    )
+
+    report = analyzer.analyze(
+        memory,
+        usage=usage,
+        now=now,
+    )
+
+    assert (
+        report.retrieval_count
+        == 2
+    )
+
+    assert (
+        report.access_count
+        == 2
+    )
+
+    assert (
+        report.has_been_retrieved
+        is True
+    )
+
+    assert (
+        report.days_since_retrieval
+        == 0.0
+    )
+
+
+def test_recent_retrieval_improves_health_score():
+    analyzer = MemoryHealthAnalyzer()
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    memory = Memory(
+        "Used memory.",
+        importance=0.8,
+        confidence=0.9,
+        created_at=(
+            now
+            - timedelta(days=45)
+        ).isoformat(),
+        updated_at=(
+            now
+            - timedelta(days=45)
+        ).isoformat(),
+    )
+
+    from memory.usage import MemoryUsage
+
+    unused = MemoryUsage()
+
+    used = MemoryUsage()
+
+    used.record_retrieval(
+        timestamp=now
+    )
+
+    unused_report = analyzer.analyze(
+        memory,
+        usage=unused,
+        now=now,
+    )
+
+    used_report = analyzer.analyze(
+        memory,
+        usage=used,
+        now=now,
+    )
+
+    assert (
+        used_report.health_score
+        > unused_report.health_score
+    )
+
+
+def test_frequent_retrieval_improves_health_score():
+    analyzer = MemoryHealthAnalyzer()
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    memory = Memory(
+        "Frequently retrieved memory.",
+        importance=0.8,
+        confidence=0.9,
+        created_at=(
+            now
+            - timedelta(days=45)
+        ).isoformat(),
+        updated_at=(
+            now
+            - timedelta(days=45)
+        ).isoformat(),
+    )
+
+    from memory.usage import MemoryUsage
+
+    low_usage = MemoryUsage()
+
+    low_usage.record_retrieval(
+        timestamp=now
+    )
+
+    high_usage = MemoryUsage()
+
+    for _ in range(10):
+        high_usage.record_retrieval(
+            timestamp=now
+        )
+
+    low_report = analyzer.analyze(
+        memory,
+        usage=low_usage,
+        now=now,
+    )
+
+    high_report = analyzer.analyze(
+        memory,
+        usage=high_usage,
+        now=now,
+    )
+
+    assert (
+        high_report.health_score
+        > low_report.health_score
+    )
+
+
+def test_old_memory_remains_stale_candidate_despite_recent_usage():
+    analyzer = MemoryHealthAnalyzer()
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    old = (
+        now
+        - timedelta(days=120)
+    ).isoformat()
+
+    memory = Memory(
+        "Old but actively used memory.",
+        importance=0.8,
+        confidence=0.9,
+        created_at=old,
+        updated_at=old,
+    )
+
+    from memory.usage import MemoryUsage
+
+    usage = MemoryUsage()
+
+    usage.record_retrieval(
+        timestamp=now
+    )
+
+    report = analyzer.analyze(
+        memory,
+        usage=usage,
+        now=now,
+    )
+
+    assert (
+        report.health
+        == MemoryHealth.STALE_CANDIDATE
+    )
+
+    assert (
+        report.health_score
+        > 0.0
+    )
+
+
+def test_usage_does_not_modify_memory():
+    analyzer = MemoryHealthAnalyzer()
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    memory = Memory(
+        "Usage analysis test.",
+        importance=0.8,
+        confidence=0.9,
+        created_at=now.isoformat(),
+        updated_at=now.isoformat(),
+    )
+
+    from memory.usage import MemoryUsage
+
+    usage = MemoryUsage()
+
+    usage.record_retrieval(
+        timestamp=now
+    )
+
+    original_status = memory.status
+    original_content = memory.content
+    original_updated_at = memory.updated_at
+
+    analyzer.analyze(
+        memory,
+        usage=usage,
+        now=now,
+    )
+
+    assert (
+        memory.status
+        == original_status
+    )
+
+    assert (
+        memory.content
+        == original_content
+    )
+
+    assert (
+        memory.updated_at
+        == original_updated_at
+    )
+
+
+def test_analyze_many_accepts_usage_map():
+    analyzer = MemoryHealthAnalyzer()
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    first = Memory(
+        "First memory.",
+        created_at=now.isoformat(),
+        updated_at=now.isoformat(),
+    )
+
+    second = Memory(
+        "Second memory.",
+        created_at=now.isoformat(),
+        updated_at=now.isoformat(),
+    )
+
+    from memory.usage import MemoryUsage
+
+    first_usage = MemoryUsage()
+
+    first_usage.record_retrieval(
+        timestamp=now
+    )
+
+    usages = {
+        first.id: first_usage,
+    }
+
+    reports = analyzer.analyze_many(
+        [
+            first,
+            second,
+        ],
+        usages=usages,
+        now=now,
+    )
+
+    assert len(reports) == 2
+
+    assert (
+        reports[0].retrieval_count
+        == 1
+    )
+
+    assert (
+        reports[1].retrieval_count
+        == 0
+    )
+
+
+def test_invalid_usage_half_life_is_rejected():
+    try:
+        MemoryHealthAnalyzer(
+            usage_half_life_days=0,
+        )
+        assert False
+    except ValueError:
+        pass
+
+
+def test_invalid_retrieval_saturation_is_rejected():
+    try:
+        MemoryHealthAnalyzer(
+            retrieval_saturation=0,
+        )
+        assert False
+    except ValueError:
+        pass
