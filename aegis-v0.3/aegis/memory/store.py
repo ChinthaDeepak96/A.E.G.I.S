@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .models import Memory, MemoryType
 
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
@@ -20,107 +21,412 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
-CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at);
-CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
+CREATE INDEX IF NOT EXISTS idx_memories_type
+    ON memories(memory_type);
+
+CREATE INDEX IF NOT EXISTS idx_memories_created
+    ON memories(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_memories_importance
+    ON memories(importance);
 """
 
 
 class SQLiteMemoryStore:
-    def __init__(self, path: str | Path = "data/aegis_memory.db"):
+    """
+    SQLite-backed persistent memory store.
+
+    Supports both:
+
+        data/aegis_memory.db
+
+    and:
+
+        :memory:
+
+    The in-memory database keeps one persistent connection so all
+    operations use the same SQLite database.
+    """
+
+    def __init__(
+        self,
+        path: str | Path = "data/aegis_memory.db",
+    ):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+
+        self._connection: sqlite3.Connection | None = None
+
+        # ---------------------------------------------------------
+        # Special handling for SQLite in-memory databases.
+        #
+        # Each sqlite3.connect(":memory:") normally creates a
+        # completely separate database. Therefore we must keep
+        # one connection alive for the lifetime of this store.
+        # ---------------------------------------------------------
+
+        if str(path) == ":memory:":
+            self._connection = sqlite3.connect(
+                ":memory:"
+            )
+
+            self._connection.row_factory = sqlite3.Row
+
+            self._initialize()
+
+        else:
+            self.path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            self._initialize()
+
+    # =========================================================
+    # CONNECTION MANAGEMENT
+    # =========================================================
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        """
+        Return the appropriate SQLite connection.
+
+        Persistent database:
+            Creates a normal short-lived connection.
+
+        In-memory database:
+            Returns the single persistent connection.
+        """
+
+        if self._connection is not None:
+            return self._connection
+
+        connection = sqlite3.connect(
+            self.path
+        )
+
         connection.row_factory = sqlite3.Row
+
         return connection
 
     def _initialize(self) -> None:
-        with self._connect() as conn:
+        """
+        Create the database schema if it doesn't already exist.
+        """
+
+        conn = self._connect()
+
+        if self._connection is not None:
+            conn.executescript(SCHEMA)
+            conn.commit()
+            return
+
+        with conn:
             conn.executescript(SCHEMA)
 
-    def save(self, memory: Memory) -> Memory:
-        with self._connect() as conn:
+        conn.close()
+
+    def close(self) -> None:
+        """
+        Close the persistent in-memory connection.
+
+        Normal file-backed connections are opened and closed per
+        operation, so there is nothing to close here.
+        """
+
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+
+    # =========================================================
+    # SAVE
+    # =========================================================
+
+    def save(
+        self,
+        memory: Memory,
+    ) -> Memory:
+        conn = self._connect()
+
+        if self._connection is not None:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO memories
-                (id, memory_type, content, importance, confidence,
-                 sensitivity, source, tags_json, metadata_json,
-                 created_at, updated_at)
+                (
+                    id,
+                    memory_type,
+                    content,
+                    importance,
+                    confidence,
+                    sensitivity,
+                    source,
+                    tags_json,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 memory.to_record(),
             )
+
+            conn.commit()
+
+            return memory
+
+        with conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO memories
+                (
+                    id,
+                    memory_type,
+                    content,
+                    importance,
+                    confidence,
+                    sensitivity,
+                    source,
+                    tags_json,
+                    metadata_json,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                memory.to_record(),
+            )
+
+        conn.close()
+
         return memory
 
-    def get(self, memory_id: str) -> Memory | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, memory_type, content, importance, confidence,
-                       sensitivity, source, tags_json, metadata_json,
-                       created_at, updated_at
-                FROM memories WHERE id = ?
-                """,
-                (memory_id,),
-            ).fetchone()
-        return Memory.from_row(tuple(row)) if row else None
+    # =========================================================
+    # GET
+    # =========================================================
 
-    def delete(self, memory_id: str) -> bool:
-        with self._connect() as conn:
-            cursor = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+    def get(
+        self,
+        memory_id: str,
+    ) -> Memory | None:
+
+        conn = self._connect()
+
+        row = conn.execute(
+            """
+            SELECT
+                id,
+                memory_type,
+                content,
+                importance,
+                confidence,
+                sensitivity,
+                source,
+                tags_json,
+                metadata_json,
+                created_at,
+                updated_at
+            FROM memories
+            WHERE id = ?
+            """,
+            (memory_id,),
+        ).fetchone()
+
+        if self._connection is None:
+            conn.close()
+
+        return (
+            Memory.from_row(tuple(row))
+            if row
+            else None
+        )
+
+    # =========================================================
+    # DELETE
+    # =========================================================
+
+    def delete(
+        self,
+        memory_id: str,
+    ) -> bool:
+
+        conn = self._connect()
+
+        cursor = conn.execute(
+            """
+            DELETE FROM memories
+            WHERE id = ?
+            """,
+            (memory_id,),
+        )
+
+        if self._connection is not None:
+            conn.commit()
+
+        else:
+            conn.commit()
+            conn.close()
+
         return cursor.rowcount > 0
 
+    # =========================================================
+    # CLEAR
+    # =========================================================
+
     def clear(self) -> int:
-        with self._connect() as conn:
-            cursor = conn.execute("DELETE FROM memories")
+
+        conn = self._connect()
+
+        cursor = conn.execute(
+            "DELETE FROM memories"
+        )
+
+        if self._connection is not None:
+            conn.commit()
+
+        else:
+            conn.commit()
+            conn.close()
+
         return cursor.rowcount
 
-    def list(self, memory_type: MemoryType | None = None, limit: int = 100) -> list[Memory]:
+    # =========================================================
+    # LIST
+    # =========================================================
+
+    def list(
+        self,
+        memory_type: MemoryType | None = None,
+        limit: int = 100,
+    ) -> list[Memory]:
+
         query = """
-        SELECT id, memory_type, content, importance, confidence,
-               sensitivity, source, tags_json, metadata_json,
-               created_at, updated_at
+        SELECT
+            id,
+            memory_type,
+            content,
+            importance,
+            confidence,
+            sensitivity,
+            source,
+            tags_json,
+            metadata_json,
+            created_at,
+            updated_at
         FROM memories
         """
+
         params: list[object] = []
+
         if memory_type:
-            query += " WHERE memory_type = ?"
-            params.append(memory_type.value)
-        query += " ORDER BY created_at DESC LIMIT ?"
-        params.append(max(1, int(limit)))
+            query += """
+            WHERE memory_type = ?
+            """
 
-        with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
-        return [Memory.from_row(tuple(row)) for row in rows]
+            params.append(
+                memory_type.value
+            )
 
-    def search_text(self, query: str, limit: int = 10) -> list[Memory]:
-        terms = [t.strip().lower() for t in query.split() if t.strip()]
+        query += """
+        ORDER BY created_at DESC
+        LIMIT ?
+        """
+
+        params.append(
+            max(1, int(limit))
+        )
+
+        conn = self._connect()
+
+        rows = conn.execute(
+            query,
+            params,
+        ).fetchall()
+
+        if self._connection is None:
+            conn.close()
+
+        return [
+            Memory.from_row(tuple(row))
+            for row in rows
+        ]
+
+    # =========================================================
+    # TEXT SEARCH
+    # =========================================================
+
+    def search_text(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> list[Memory]:
+
+        terms = [
+            term.strip().lower()
+            for term in query.split()
+            if term.strip()
+        ]
+
         if not terms:
             return []
 
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, memory_type, content, importance, confidence,
-                       sensitivity, source, tags_json, metadata_json,
-                       created_at, updated_at
-                FROM memories
-                """
-            ).fetchall()
+        conn = self._connect()
 
-        memories = [Memory.from_row(tuple(row)) for row in rows]
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                memory_type,
+                content,
+                importance,
+                confidence,
+                sensitivity,
+                source,
+                tags_json,
+                metadata_json,
+                created_at,
+                updated_at
+            FROM memories
+            """
+        ).fetchall()
 
-        def score(memory: Memory) -> float:
-            text = (memory.content + " " + " ".join(memory.tags)).lower()
-            hits = sum(1 for term in terms if term in text)
-            return hits * 2.0 + memory.importance + memory.confidence
+        if self._connection is None:
+            conn.close()
+
+        memories = [
+            Memory.from_row(tuple(row))
+            for row in rows
+        ]
+
+        def score(
+            memory: Memory,
+        ) -> float:
+
+            text = (
+                memory.content
+                + " "
+                + " ".join(memory.tags)
+            ).lower()
+
+            hits = sum(
+                1
+                for term in terms
+                if term in text
+            )
+
+            return (
+                hits * 2.0
+                + memory.importance
+                + memory.confidence
+            )
 
         ranked = sorted(
-            (m for m in memories if score(m) > 0),
+            (
+                memory
+                for memory in memories
+                if score(memory) > 0
+            ),
             key=score,
             reverse=True,
         )
-        return ranked[:max(1, int(limit))]
+
+        return ranked[
+            : max(1, int(limit))
+        ]

@@ -4,12 +4,21 @@ A.E.G.I.S. -- conversational personality and primary human interface.
 v0.4 adds persistent memory integration on top of the v0.3
 conversation + tool architecture.
 
+v0.4.2d adds automatic memory extraction.
+
 Memory responsibilities:
 - Relevant memories are recalled before normal LLM requests.
 - Explicit /memory commands are handled locally.
 - Memory is persisted through MemoryManager.
-- The LLM is NOT yet allowed to autonomously create arbitrary memories.
-  Automatic memory extraction is a later v0.4 milestone.
+- Meaningful conversations are analyzed for possible memories.
+- Automatically extracted memories pass through:
+    MemoryExtractor
+        -> MemoryManager
+        -> Duplicate Detection
+        -> MemoryPolicy
+        -> SQLite
+- Sensitive memories are not automatically stored.
+- The LLM never writes directly to the database.
 """
 
 from __future__ import annotations
@@ -17,9 +26,17 @@ from __future__ import annotations
 from typing import Callable
 
 from core import guardian
-from core.llm_client import LLMResponse, TextBlock, ToolUseBlock
-from core.tools import TOOLS, anthropic_tool_schemas
+from core.llm_client import (
+    LLMResponse,
+    TextBlock,
+    ToolUseBlock,
+)
+from core.tools import (
+    TOOLS,
+    anthropic_tool_schemas,
+)
 from memory import MemoryManager, MemoryType
+from memory.extractor import MemoryExtractor
 
 
 SYSTEM_PROMPT = """You are AEGIS, the personal AI interface for the A.E.G.I.S.
@@ -30,6 +47,7 @@ You are running in v0.4.
 Current capabilities:
 - Conversation
 - Persistent personal memory
+- Automatic memory extraction
 - File and system tools
 - Running-process inspection
 - Open-window inspection
@@ -44,14 +62,15 @@ MEDIUM/HIGH-risk tools require explicit user confirmation.
 Memory:
 - A.E.G.I.S. has persistent memory across sessions.
 - Relevant memories may be supplied as context for a conversation.
+- A.E.G.I.S. can identify potentially useful long-term memories from
+  meaningful conversations.
+- Automatically extracted memories are filtered by the memory policy.
+- Sensitive information is not automatically stored.
 - Do not claim to remember something unless it is present in the
   supplied memory context or the current conversation.
 - Do not invent memories.
 - Do not expose memory metadata unless the user asks.
 - The user can explicitly manage memory through the /memory commands.
-
-Memory is currently a foundation system. Automatic extraction of memories
-from ordinary conversation is not enabled yet.
 
 Computer control:
 - Keyboard and mouse control acts on whatever window currently has focus.
@@ -83,6 +102,15 @@ No excessive enthusiasm or filler.
 
 TOOL_LOOP_LIMIT = 5
 
+# Automatic extraction is deliberately conservative.
+# A memory-analysis LLM call is made after this many meaningful
+# user turns since the previous extraction pass.
+MEMORY_EXTRACTION_TURN_INTERVAL = 2
+
+# Only inspect the recent conversation for automatic extraction.
+MEMORY_EXTRACTION_HISTORY_LIMIT = 12
+
+
 ConfirmCallback = Callable[[str, str, dict], bool]
 
 
@@ -109,6 +137,7 @@ def _memory_help() -> str:
         "  /memory forget <id>        - delete one memory\n"
         "  /memory clear              - delete all memories"
     )
+
 
 def handle_command(
     text: str,
@@ -235,7 +264,11 @@ def _handle_memory_command(
             )
 
         query = args[1].strip()
-        memories = memory_manager.recall(query, limit=10)
+
+        memories = memory_manager.recall(
+            query,
+            limit=10,
+        )
 
         return CommandResult(
             handled=True,
@@ -259,7 +292,9 @@ def _handle_memory_command(
 
         memory_id = args[1].strip()
 
-        memory = memory_manager.get(memory_id)
+        memory = memory_manager.get(
+            memory_id
+        )
 
         if memory is None:
             return CommandResult(
@@ -269,7 +304,9 @@ def _handle_memory_command(
 
         return CommandResult(
             handled=True,
-            output=memory_manager.format_memory(memory),
+            output=memory_manager.format_memory(
+                memory
+            ),
         )
 
     if action == "forget":
@@ -281,7 +318,9 @@ def _handle_memory_command(
 
         memory_id = args[1].strip()
 
-        memory = memory_manager.store.get(memory_id)
+        memory = memory_manager.get(
+            memory_id
+        )
 
         if memory is None:
             return CommandResult(
@@ -304,7 +343,9 @@ def _handle_memory_command(
                 output="Memory deletion denied by Guardian.",
             )
 
-        deleted = memory_manager.forget(memory_id)
+        deleted = memory_manager.forget(
+            memory_id
+        )
 
         return CommandResult(
             handled=True,
@@ -340,7 +381,10 @@ def _handle_memory_command(
 
     return CommandResult(
         handled=True,
-        output=f"Unknown memory command: {action}\n\n{_memory_help()}",
+        output=(
+            f"Unknown memory command: {action}\n\n"
+            f"{_memory_help()}"
+        ),
     )
 
 
@@ -414,8 +458,8 @@ class AEGIS:
     """
     Main A.E.G.I.S. runtime.
 
-    v0.4 introduces persistent memory while preserving the v0.3
-    tool/Guardian architecture.
+    v0.4.2d integrates automatic memory extraction while preserving
+    the existing v0.3 tool and Guardian architecture.
     """
 
     def __init__(
@@ -423,11 +467,26 @@ class AEGIS:
         llm_client,
         history_limit: int = 40,
         memory_manager: MemoryManager | None = None,
+        memory_extractor: MemoryExtractor | None = None,
     ):
         self._llm = llm_client
         self._history: list[dict] = []
         self._history_limit = history_limit
+
         self._memory = memory_manager
+
+        self._memory_extractor = (
+            memory_extractor
+            if memory_extractor is not None
+            else (
+                MemoryExtractor(llm_client)
+                if memory_manager is not None
+                else None
+            )
+        )
+
+        self._memory_extraction_turns = 0
+
         self.should_exit = False
 
     @property
@@ -436,6 +495,7 @@ class AEGIS:
 
     def reset(self) -> None:
         self._history = []
+        self._memory_extraction_turns = 0
 
     def respond(
         self,
@@ -450,6 +510,7 @@ class AEGIS:
         )
 
         if cmd.handled:
+
             if cmd.should_exit:
                 self.should_exit = True
 
@@ -465,6 +526,8 @@ class AEGIS:
                 "content": user_input,
             }
         )
+
+        self._memory_extraction_turns += 1
 
         self._trim_history()
 
@@ -494,19 +557,32 @@ class AEGIS:
             self._history.append(
                 {
                     "role": "assistant",
-                    "content": _response_to_api_content(response),
+                    "content": _response_to_api_content(
+                        response
+                    ),
                 }
             )
 
             self._trim_history()
 
             if response.stop_reason != "tool_use":
-                return _extract_text(response)
+
+                answer = _extract_text(
+                    response
+                )
+
+                self._maybe_extract_memories()
+
+                return answer
 
             tool_results = []
 
             for block in response.content:
-                if not isinstance(block, ToolUseBlock):
+
+                if not isinstance(
+                    block,
+                    ToolUseBlock,
+                ):
                     continue
 
                 tool_results.append(
@@ -530,10 +606,15 @@ class AEGIS:
             "-- try rephrasing the request."
         )
 
+    # =========================================================
+    # MEMORY
+    # =========================================================
+
     def _build_memory_context(
         self,
         user_input: str,
     ) -> str:
+
         if self._memory is None:
             return ""
 
@@ -542,13 +623,69 @@ class AEGIS:
             limit=8,
         )
 
+    def _maybe_extract_memories(self) -> None:
+        """
+        Run automatic memory extraction after enough meaningful
+        conversation has accumulated.
+
+        Extraction failures are intentionally silent so that a memory
+        failure never breaks the main assistant conversation.
+        """
+
+        if self._memory is None:
+            return
+
+        if self._memory_extractor is None:
+            return
+
+        if (
+            self._memory_extraction_turns
+            < MEMORY_EXTRACTION_TURN_INTERVAL
+        ):
+            return
+
+        messages = self._history[
+            -MEMORY_EXTRACTION_HISTORY_LIMIT:
+        ]
+
+        try:
+            candidates = (
+                self._memory_extractor.extract(
+                    messages
+                )
+            )
+        except Exception:
+            # Memory extraction must never crash A.E.G.I.S.
+            return
+
+        for candidate in candidates:
+
+            self._memory.store_candidate(
+                candidate.content,
+                candidate.memory_type,
+                importance=candidate.importance,
+                confidence=candidate.confidence,
+                sensitivity=candidate.sensitivity,
+                source="automatic_extraction",
+                tags=candidate.tags,
+            )
+
+        # Reset only after an extraction attempt.
+        self._memory_extraction_turns = 0
+
+    # =========================================================
+    # TOOL EXECUTION
+    # =========================================================
+
     def _handle_tool_call(
         self,
         block: ToolUseBlock,
         confirm: ConfirmCallback | None,
     ) -> dict:
 
-        tool = TOOLS.get(block.name)
+        tool = TOOLS.get(
+            block.name
+        )
 
         if tool is None:
             return _tool_result(
@@ -556,7 +693,9 @@ class AEGIS:
                 f"Error: unknown tool '{block.name}'.",
             )
 
-        decision = guardian.review(tool)
+        decision = guardian.review(
+            tool
+        )
 
         if decision.decision == guardian.CONFIRM:
 
@@ -578,17 +717,24 @@ class AEGIS:
                 )
 
         try:
-            output = tool.handler(**block.input)
+            output = tool.handler(
+                **block.input
+            )
 
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             output = (
-                f"Error executing tool '{tool.name}': {exc}"
+                f"Error executing tool "
+                f"'{tool.name}': {exc}"
             )
 
         return _tool_result(
             block.id,
             output,
         )
+
+    # =========================================================
+    # HISTORY
+    # =========================================================
 
     def _trim_history(self) -> None:
         """
@@ -598,7 +744,10 @@ class AEGIS:
         later v0.4 milestone.
         """
 
-        if len(self._history) > self._history_limit:
+        if (
+            len(self._history)
+            > self._history_limit
+        ):
             self._history = self._history[
                 -self._history_limit:
             ]

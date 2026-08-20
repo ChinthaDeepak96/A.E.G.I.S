@@ -9,6 +9,8 @@ says no.
 
 from core.llm_client import LLMResponse, MockClient, TextBlock, ToolUseBlock
 from core.aegis import AEGIS, handle_command
+from memory import MemoryManager
+
 
 # ---------------------------------------------------------------------------
 # v0.1: plain conversation, unchanged behavior
@@ -205,3 +207,135 @@ def test_tool_loop_gives_up_after_max_iterations():
     reply = aegis.respond("keep checking my system info forever")
     assert "wasn't able to finish" in reply
     assert len(client.calls) == 5  # TOOL_LOOP_LIMIT
+def test_automatic_memory_extraction_is_triggered_after_meaningful_turns():
+    from memory.extractor import MemoryCandidate
+    from memory.models import MemoryType
+
+    class FakeExtractor:
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, messages):
+            self.calls += 1
+
+            return [
+                MemoryCandidate(
+                    content="User is building A.E.G.I.S.",
+                    memory_type=MemoryType.SEMANTIC,
+                    importance=0.95,
+                    confidence=0.95,
+                    sensitivity=0.0,
+                    tags=["aegis"],
+                )
+            ]
+
+    memory_manager = MemoryManager(
+        database_path=":memory:"
+    )
+
+    extractor = FakeExtractor()
+
+    client = MockClient(
+        reply="Understood."
+    )
+
+    aegis = AEGIS(
+        client,
+        memory_manager=memory_manager,
+        memory_extractor=extractor,
+    )
+
+    aegis.respond(
+        "I am building A.E.G.I.S."
+    )
+
+    assert extractor.calls == 0
+
+    aegis.respond(
+        "It is going to become my personal AI platform."
+    )
+
+    assert extractor.calls == 1
+
+    memories = memory_manager.recent()
+
+    assert len(memories) == 1
+    assert (
+        memories[0].content
+        == "User is building A.E.G.I.S."
+    )
+
+
+def test_automatic_memory_duplicate_is_not_stored_twice():
+    from memory.extractor import MemoryCandidate
+    from memory.models import MemoryType
+
+    class FakeExtractor:
+        def extract(self, messages):
+            return [
+                MemoryCandidate(
+                    content="User is building A.E.G.I.S.",
+                    memory_type=MemoryType.SEMANTIC,
+                    importance=0.95,
+                    confidence=0.95,
+                    sensitivity=0.0,
+                    tags=["aegis"],
+                )
+            ]
+
+    memory_manager = MemoryManager(
+        database_path=":memory:"
+    )
+
+    extractor = FakeExtractor()
+
+    client = MockClient(
+        reply="Understood."
+    )
+
+    aegis = AEGIS(
+        client,
+        memory_manager=memory_manager,
+        memory_extractor=extractor,
+    )
+
+    aegis.respond(
+        "I am building A.E.G.I.S."
+    )
+
+    aegis.respond(
+        "This is my long-term AI platform."
+    )
+
+    aegis.respond(
+        "I am continuing development."
+    )
+
+    aegis.respond(
+        "The project is becoming more advanced."
+    )
+
+    memories = memory_manager.recent()
+
+    assert len(memories) == 1
+
+
+def test_sensitive_automatic_memory_is_rejected():
+    from memory.models import MemoryType
+
+    memory_manager = MemoryManager(
+        database_path=":memory:"
+    )
+
+    status, memory = (
+        memory_manager.store_candidate(
+            "Sensitive personal information.",
+            MemoryType.SEMANTIC,
+            importance=0.95,
+            confidence=0.95,
+            sensitivity=0.90,
+        )
+    )
+
+    assert status == "rejected"
+    assert memory is None
