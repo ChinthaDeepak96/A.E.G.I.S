@@ -26,6 +26,11 @@ from .consolidation import (
     MemoryConsolidator,
 )
 
+from .health import (
+    MemoryHealth,
+    MemoryHealthAnalyzer,
+    MemoryHealthReport,
+)
 
 __all__ = [
     "ConflictResult",
@@ -42,4 +47,7 @@ __all__ = [
     "MemoryExtractor",
     "ConsolidationProposal",
     "MemoryConsolidator",
+    "MemoryHealth",
+    "MemoryHealthAnalyzer",
+    "MemoryHealthReport",
 ]

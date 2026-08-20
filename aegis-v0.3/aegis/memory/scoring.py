@@ -9,13 +9,15 @@ Combines multiple signals to rank retrieved memories:
 - confidence
 - recency
 
-Lifecycle filtering remains the responsibility of the store/retriever.
+Semantic similarity may be supplied by the retrieval layer.
 
-The scorer does not modify memories.
+When a precomputed semantic score is supplied, the scorer
+reuses it and does not generate another embedding.
 
-The lexical relevance API remains backward compatible.
-Semantic relevance is an additional signal used when semantic
-embeddings are available.
+When no semantic score is supplied, MemoryScorer can lazily
+use MemoryEmbedder for standalone semantic scoring.
+
+The scorer does not access SQLite and does not modify memories.
 """
 
 from __future__ import annotations
@@ -23,9 +25,16 @@ from __future__ import annotations
 import math
 import re
 from datetime import datetime, timezone
+from typing import Callable
 
 from .embeddings import MemoryEmbedder
 from .models import Memory
+
+
+SemanticProvider = Callable[
+    [Memory, str],
+    float,
+]
 
 
 class MemoryScorer:
@@ -40,7 +49,13 @@ class MemoryScorer:
         confidence
         recency
 
-    The embedding model is loaded lazily through MemoryEmbedder.
+    Semantic relevance can be:
+
+        1. supplied directly to score() / rank()
+        2. calculated through a semantic provider
+        3. calculated through MemoryEmbedder
+
+    The embedding model is loaded lazily.
     """
 
     DEFAULT_WEIGHTS = {
@@ -54,6 +69,7 @@ class MemoryScorer:
     def __init__(
         self,
         weights: dict[str, float] | None = None,
+        semantic_provider: SemanticProvider | None = None,
         embedder: MemoryEmbedder | None = None,
     ):
         self.weights = (
@@ -68,6 +84,10 @@ class MemoryScorer:
             else MemoryEmbedder()
         )
 
+        self.semantic_provider = (
+            semantic_provider
+        )
+
         self._normalize_weights()
 
     # =========================================================
@@ -78,17 +98,27 @@ class MemoryScorer:
         self,
         memory: Memory,
         query: str,
+        *,
+        semantic_score: float | None = None,
     ) -> float:
         """
-        Calculate a final ranking score between 0.0 and 1.0.
+        Calculate a final ranking score.
 
-        The score combines:
+        Args:
+            memory:
+                Memory being scored.
 
-            lexical relevance
-            semantic relevance
-            importance
-            confidence
-            recency
+            query:
+                User query.
+
+            semantic_score:
+                Optional precomputed cosine similarity.
+
+                When supplied, the embedding model is not
+                called again.
+
+        Returns:
+            Score in the range [0.0, 1.0].
         """
 
         lexical_relevance = self.relevance(
@@ -96,10 +126,19 @@ class MemoryScorer:
             query,
         )
 
-        semantic_relevance = self.semantic_relevance(
-            memory,
-            query,
-        )
+        if semantic_score is None:
+            semantic_relevance = (
+                self.semantic_relevance(
+                    memory,
+                    query,
+                )
+            )
+        else:
+            semantic_relevance = (
+                self._semantic_similarity_to_score(
+                    semantic_score
+                )
+            )
 
         importance = self._clamp(
             memory.importance
@@ -112,6 +151,14 @@ class MemoryScorer:
         recency = self.recency(
             memory
         )
+
+        # -----------------------------------------------------
+        # Combine lexical and semantic relevance.
+        #
+        # Semantic also has its own explicit weight so that
+        # semantic matches can remain useful even when lexical
+        # overlap is weak.
+        # -----------------------------------------------------
 
         combined_relevance = (
             lexical_relevance * 0.5
@@ -154,8 +201,7 @@ class MemoryScorer:
         - exact token matches
         - phrase match
 
-        This method intentionally remains lexical for
-        backward compatibility with existing callers.
+        This method remains lexical for backward compatibility.
         """
 
         query_tokens = self._tokens(
@@ -233,14 +279,23 @@ class MemoryScorer:
         query: str,
     ) -> float:
         """
-        Calculate semantic relevance between a memory and query.
+        Calculate semantic relevance.
 
-        Semantic relevance is normalized from cosine similarity
-        [-1.0, 1.0] into [0.0, 1.0].
+        Priority:
 
-        The scorer intentionally computes this directly from
-        memory content rather than requiring SQLite access.
-        This keeps MemoryScorer independent from persistence.
+            1. custom semantic provider
+            2. MemoryEmbedder
+
+        The provider/embedder returns cosine similarity in
+        approximately [-1.0, 1.0].
+
+        Conversion:
+
+            similarity <= 0.0  -> 0.0 relevance
+            similarity >  0.0  -> similarity
+
+        This prevents unrelated vectors with cosine similarity
+        near zero from incorrectly becoming 0.5 relevance.
         """
 
         query = query.strip()
@@ -249,10 +304,21 @@ class MemoryScorer:
             return 0.0
 
         try:
-            similarity = self.embedder.similarity(
-                memory.content,
-                query,
-            )
+            if self.semantic_provider is not None:
+                similarity = float(
+                    self.semantic_provider(
+                        memory,
+                        query,
+                    )
+                )
+            else:
+                similarity = float(
+                    self.embedder.similarity(
+                        memory.content,
+                        query,
+                    )
+                )
+
         except (
             TypeError,
             ValueError,
@@ -260,12 +326,26 @@ class MemoryScorer:
         ):
             return 0.0
 
-        normalized = (
-            similarity + 1.0
-        ) / 2.0
+        return self._semantic_similarity_to_score(
+            similarity
+        )
 
-        return self._clamp(
-            normalized
+    @staticmethod
+    def _semantic_similarity_to_score(
+        similarity: float,
+    ) -> float:
+        """
+        Convert cosine similarity into [0.0, 1.0].
+
+        Values <= 0 are treated as no semantic relevance.
+        """
+
+        return max(
+            0.0,
+            min(
+                1.0,
+                float(similarity),
+            ),
         )
 
     # =========================================================
@@ -281,7 +361,7 @@ class MemoryScorer:
         """
         Calculate recency using exponential decay.
 
-        A newly created memory approaches 1.0.
+        A newly updated memory approaches 1.0.
 
         Older memories gradually approach 0.0.
         """
@@ -329,27 +409,48 @@ class MemoryScorer:
         self,
         memories: list[Memory],
         query: str,
+        *,
+        semantic_scores: dict[str, float]
+        | None = None,
     ) -> list[Memory]:
         """
-        Return memories sorted from highest score to lowest.
+        Rank memories from highest score to lowest.
 
-        Ties are resolved deterministically using:
+        semantic_scores maps:
 
-        1. importance
-        2. confidence
-        3. updated timestamp
+            memory_id -> cosine similarity
+
+        When supplied, the precomputed values are reused.
+
+        Memories without a supplied semantic score fall back
+        to normal semantic_relevance().
         """
 
-        scored = [
-            (
-                memory,
-                self.score(
-                    memory,
-                    query,
-                ),
+        semantic_scores = (
+            semantic_scores or {}
+        )
+
+        scored = []
+
+        for memory in memories:
+            precomputed = (
+                semantic_scores.get(
+                    memory.id
+                )
             )
-            for memory in memories
-        ]
+
+            score = self.score(
+                memory,
+                query,
+                semantic_score=precomputed,
+            )
+
+            scored.append(
+                (
+                    memory,
+                    score,
+                )
+            )
 
         scored.sort(
             key=lambda item: (
@@ -374,11 +475,13 @@ class MemoryScorer:
         self,
         memory: Memory,
         query: str,
+        *,
+        semantic_score: float | None = None,
     ) -> dict[str, float]:
         """
         Return individual scoring components.
 
-        Useful for debugging and future observability.
+        If semantic_score is supplied, it is reused.
         """
 
         lexical = self.relevance(
@@ -386,10 +489,17 @@ class MemoryScorer:
             query,
         )
 
-        semantic = self.semantic_relevance(
-            memory,
-            query,
-        )
+        if semantic_score is None:
+            semantic = self.semantic_relevance(
+                memory,
+                query,
+            )
+        else:
+            semantic = (
+                self._semantic_similarity_to_score(
+                    semantic_score
+                )
+            )
 
         importance = self._clamp(
             memory.importance
@@ -406,6 +516,7 @@ class MemoryScorer:
         final = self.score(
             memory,
             query,
+            semantic_score=semantic,
         )
 
         return {
@@ -427,8 +538,6 @@ class MemoryScorer:
     ) -> None:
         """
         Normalize configured weights so they sum to 1.0.
-
-        Missing supported keys receive zero.
         """
 
         supported = {
@@ -453,7 +562,7 @@ class MemoryScorer:
             self.weights.values()
         )
 
-        if total <= 0:
+        if total <= 0.0:
             self.weights = dict(
                 self.DEFAULT_WEIGHTS
             )
