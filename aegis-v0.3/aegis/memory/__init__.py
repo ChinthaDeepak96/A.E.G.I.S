@@ -32,6 +32,18 @@ from .health import (
     MemoryHealthReport,
 )
 
+from .maintenance import (
+    MaintenanceAction,
+    MaintenanceProposal,
+    MemoryMaintenancePlanner,
+)
+
+from .usage import MemoryUsage
+
+from .usage_store import (
+    SQLiteMemoryUsageStore,
+)
+
 __all__ = [
     "ConflictResult",
     "MemoryConflictDetector",
@@ -50,4 +62,9 @@ __all__ = [
     "MemoryHealth",
     "MemoryHealthAnalyzer",
     "MemoryHealthReport",
+    "MaintenanceAction",
+    "MaintenanceProposal",
+    "MemoryMaintenancePlanner",
+    "MemoryUsage",
+    "SQLiteMemoryUsageStore",
 ]
