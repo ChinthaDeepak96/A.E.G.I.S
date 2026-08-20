@@ -1,15 +1,15 @@
 """
-AEGIS -- the conversational personality and primary human interface
-(architecture doc section 6; renamed from "MAX" per project owner's
-request -- the assistant now identifies itself as AEGIS directly
-rather than under a separate character name).
+A.E.G.I.S. -- conversational personality and primary human interface.
 
-v0.2 adds tool use: AEGIS can now decide to call a tool, but every
-call is reviewed by Guardian Lite (core/guardian.py) first. LOW-risk
-tools execute automatically; MEDIUM/HIGH-risk tools are blocked
-unless the caller supplies a `confirm` callback that approves them.
-No memory beyond the current session, no full Guardian, no voice
-yet -- those arrive in later versions.
+v0.4 adds persistent memory integration on top of the v0.3
+conversation + tool architecture.
+
+Memory responsibilities:
+- Relevant memories are recalled before normal LLM requests.
+- Explicit /memory commands are handled locally.
+- Memory is persisted through MemoryManager.
+- The LLM is NOT yet allowed to autonomously create arbitrary memories.
+  Automatic memory extraction is a later v0.4 milestone.
 """
 
 from __future__ import annotations
@@ -19,57 +19,125 @@ from typing import Callable
 from core import guardian
 from core.llm_client import LLMResponse, TextBlock, ToolUseBlock
 from core.tools import TOOLS, anthropic_tool_schemas
+from memory import MemoryManager, MemoryType
 
-SYSTEM_PROMPT = """You are AEGIS, the personal AI interface for the A.E.G.I.S. \
+
+SYSTEM_PROMPT = """You are AEGIS, the personal AI interface for the A.E.G.I.S.
 platform (Autonomous Electronic Guardian Intelligence System).
 
-You are running in v0.3: alongside the file/system tools from v0.2, \
-you can now see running processes and open window titles, launch or \
-close applications, and control the keyboard and mouse directly. \
-Every tool call is gated by Guardian based on its risk level -- \
-low-risk tools (reading things, opening a named application) run \
-automatically; anything that types, clicks, or closes something \
-requires the user's explicit confirmation, which you should wait \
-for rather than assuming approval. Keyboard/mouse control acts on \
-whatever window currently has focus, which you cannot directly see \
-the contents of -- say so plainly if that matters to a request \
-rather than guessing at what's on screen. You do not yet have \
-persistent memory across sessions, a full agent system, real visual \
-screen reading, or voice -- if asked for something beyond your \
-current tools, say plainly that it isn't built yet.
+You are running in v0.4.
 
-Personality: calm, direct, competent. Brief by default; detailed \
-when the question calls for it. No excessive enthusiasm, no filler."""
+Current capabilities:
+- Conversation
+- Persistent personal memory
+- File and system tools
+- Running-process inspection
+- Open-window inspection
+- Application launching and closing
+- Keyboard and mouse control
 
-# Bounded retries (architecture doc section 22): AEGIS should not
-# loop on itself indefinitely if the model keeps requesting tools
-# without ever reaching a final answer.
+Every tool call is reviewed by Guardian based on its risk level.
+
+LOW-risk tools execute automatically.
+MEDIUM/HIGH-risk tools require explicit user confirmation.
+
+Memory:
+- A.E.G.I.S. has persistent memory across sessions.
+- Relevant memories may be supplied as context for a conversation.
+- Do not claim to remember something unless it is present in the
+  supplied memory context or the current conversation.
+- Do not invent memories.
+- Do not expose memory metadata unless the user asks.
+- The user can explicitly manage memory through the /memory commands.
+
+Memory is currently a foundation system. Automatic extraction of memories
+from ordinary conversation is not enabled yet.
+
+Computer control:
+- Keyboard and mouse control acts on whatever window currently has focus.
+- You cannot directly see the contents of the screen yet.
+- Do not guess what is displayed.
+- Real visual screen understanding is not implemented yet.
+
+You do not yet have:
+- Voice input/output
+- Wake-word detection
+- Full Guardian
+- Visual screen understanding
+- Sensor fusion
+- GPS awareness
+- Phone integration
+- Physical robotics
+- Autonomous vehicle control
+
+If asked for something outside your current capabilities, say plainly that
+it is not implemented yet.
+
+Personality:
+Calm, direct, competent.
+Brief by default.
+Detailed when the question requires it.
+No excessive enthusiasm or filler.
+"""
+
+
 TOOL_LOOP_LIMIT = 5
 
 ConfirmCallback = Callable[[str, str, dict], bool]
 
 
 class CommandResult:
-    def __init__(self, handled: bool, output: str | None = None, should_exit: bool = False):
+    def __init__(
+        self,
+        handled: bool,
+        output: str | None = None,
+        should_exit: bool = False,
+    ):
         self.handled = handled
         self.output = output
         self.should_exit = should_exit
 
 
-def handle_command(text: str) -> CommandResult:
+def _memory_help() -> str:
+    return (
+        "Memory commands:\n"
+        "  /memory                    - show recent memories\n"
+        "  /memory remember <text>    - explicitly store a memory\n"
+        "  /memory recall <query>     - search memories\n"
+        "  /memory recent             - show recent memories\n"
+        "  /memory forget <id>        - delete one memory\n"
+        "  /memory clear              - delete all memories"
+    )
+
+
+def handle_command(
+    text: str,
+    memory_manager: MemoryManager | None = None,
+    confirm: ConfirmCallback | None = None,
+) -> CommandResult:
     """
-    Basic command handling (v0.1 scope, still in effect). Slash
-    commands are intercepted before anything reaches the LLM.
+    Handle local slash commands before anything reaches the LLM.
+
+    Memory commands are deliberately handled outside the LLM so that
+    memory operations remain deterministic and controllable.
     """
+
     stripped = text.strip()
+
     if not stripped.startswith("/"):
         return CommandResult(handled=False)
 
-    command, *_ = stripped[1:].split(maxsplit=1)
-    command = command.lower()
+    parts = stripped[1:].split(maxsplit=2)
+
+    command = parts[0].lower() if parts else ""
 
     if command in ("quit", "exit"):
-        return CommandResult(handled=True, output="Shutting down.", should_exit=True)
+        return CommandResult(
+            handled=True,
+            output="Shutting down.",
+            should_exit=True,
+        )
+
     if command == "help":
         return CommandResult(
             handled=True,
@@ -77,114 +145,438 @@ def handle_command(text: str) -> CommandResult:
                 "Available commands:\n"
                 "  /help   - show this message\n"
                 "  /reset  - clear conversation history\n"
+                "  /memory - manage persistent memory\n"
                 "  /quit   - exit\n"
-                "Anything else is sent to AEGIS as conversation."
+                "Anything else is sent to AEGIS as conversation.\n\n"
+                + _memory_help()
             ),
         )
+
     if command == "reset":
-        return CommandResult(handled=True, output="__RESET__")
+        return CommandResult(
+            handled=True,
+            output="__RESET__",
+        )
 
-    return CommandResult(handled=True, output=f"Unknown command: /{command}. Try /help.")
+    if command == "memory":
+        if memory_manager is None:
+            return CommandResult(
+                handled=True,
+                output="Memory subsystem is unavailable.",
+            )
+
+        return _handle_memory_command(
+            parts[1:],
+            memory_manager,
+            confirm,
+        )
+
+    return CommandResult(
+        handled=True,
+        output=f"Unknown command: /{command}. Try /help.",
+    )
 
 
-def _response_to_api_content(response: LLMResponse) -> list[dict]:
-    """Convert a normalized LLMResponse back into Anthropic API message-content
-    format, so it can be stored in history and replayed on the next call."""
+def _handle_memory_command(
+    args: list[str],
+    memory_manager: MemoryManager,
+    confirm: ConfirmCallback | None,
+) -> CommandResult:
+
+    if not args:
+        return CommandResult(
+            handled=True,
+            output=_format_memories(
+                memory_manager.recent(limit=10)
+            ),
+        )
+
+    action = args[0].lower()
+
+    if action == "help":
+        return CommandResult(
+            handled=True,
+            output=_memory_help(),
+        )
+
+    if action == "remember":
+        if len(args) < 2 or not args[1].strip():
+            return CommandResult(
+                handled=True,
+                output="Usage: /memory remember <text>",
+            )
+
+        content = args[1].strip()
+
+        memory = memory_manager.remember(
+            content,
+            memory_type=MemoryType.PREFERENCE,
+            importance=0.8,
+            source="explicit_command",
+            explicit=True,
+        )
+
+        if memory is None:
+            return CommandResult(
+                handled=True,
+                output="I couldn't store that memory.",
+            )
+
+        return CommandResult(
+            handled=True,
+            output=f"Memory saved. ID: {memory.id}",
+        )
+
+    if action == "recall":
+        if len(args) < 2 or not args[1].strip():
+            return CommandResult(
+                handled=True,
+                output="Usage: /memory recall <query>",
+            )
+
+        query = args[1].strip()
+        memories = memory_manager.recall(query, limit=10)
+
+        return CommandResult(
+            handled=True,
+            output=_format_memories(memories),
+        )
+
+    if action == "recent":
+        return CommandResult(
+            handled=True,
+            output=_format_memories(
+                memory_manager.recent(limit=10)
+            ),
+        )
+
+    if action == "forget":
+        if len(args) < 2 or not args[1].strip():
+            return CommandResult(
+                handled=True,
+                output="Usage: /memory forget <memory-id>",
+            )
+
+        memory_id = args[1].strip()
+
+        memory = memory_manager.store.get(memory_id)
+
+        if memory is None:
+            return CommandResult(
+                handled=True,
+                output=f"No memory found with ID: {memory_id}",
+            )
+
+        approved = bool(
+            confirm
+            and confirm(
+                "memory_forget",
+                guardian.RISK_HIGH,
+                {"memory_id": memory_id},
+            )
+        )
+
+        if not approved:
+            return CommandResult(
+                handled=True,
+                output="Memory deletion denied by Guardian.",
+            )
+
+        deleted = memory_manager.forget(memory_id)
+
+        return CommandResult(
+            handled=True,
+            output=(
+                "Memory deleted."
+                if deleted
+                else "Memory could not be deleted."
+            ),
+        )
+
+    if action == "clear":
+        approved = bool(
+            confirm
+            and confirm(
+                "memory_clear",
+                guardian.RISK_HIGH,
+                {},
+            )
+        )
+
+        if not approved:
+            return CommandResult(
+                handled=True,
+                output="Memory clearing denied by Guardian.",
+            )
+
+        count = memory_manager.clear()
+
+        return CommandResult(
+            handled=True,
+            output=f"Deleted {count} memories.",
+        )
+
+    return CommandResult(
+        handled=True,
+        output=f"Unknown memory command: {action}\n\n{_memory_help()}",
+    )
+
+
+def _format_memories(memories) -> str:
+    if not memories:
+        return "No memories found."
+
+    lines = []
+
+    for memory in memories:
+        lines.append(
+            f"[{memory.id}] "
+            f"{memory.memory_type.value}: "
+            f"{memory.content}"
+        )
+
+    return "\n".join(lines)
+
+
+def _response_to_api_content(
+    response: LLMResponse,
+) -> list[dict]:
+    """Convert normalized response into history-compatible content."""
+
     blocks = []
+
     for block in response.content:
         if isinstance(block, TextBlock):
-            blocks.append({"type": "text", "text": block.text})
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": block.text,
+                }
+            )
+
         elif isinstance(block, ToolUseBlock):
-            blocks.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                }
+            )
+
     return blocks
 
 
-def _tool_result(tool_use_id: str, content: str) -> dict:
-    return {"type": "tool_result", "tool_use_id": tool_use_id, "content": content}
+def _tool_result(
+    tool_use_id: str,
+    content: str,
+) -> dict:
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content,
+    }
 
 
-def _extract_text(response: LLMResponse) -> str:
-    return "".join(b.text for b in response.content if isinstance(b, TextBlock))
+def _extract_text(
+    response: LLMResponse,
+) -> str:
+    return "".join(
+        block.text
+        for block in response.content
+        if isinstance(block, TextBlock)
+    )
 
 
 class AEGIS:
     """
-    Owns conversation state (working memory only, for v0.1/v0.2) and
-    routes input between command handling, tool use, and the LLM.
+    Main A.E.G.I.S. runtime.
+
+    v0.4 introduces persistent memory while preserving the v0.3
+    tool/Guardian architecture.
     """
 
-    def __init__(self, llm_client, history_limit: int = 40):
+    def __init__(
+        self,
+        llm_client,
+        history_limit: int = 40,
+        memory_manager: MemoryManager | None = None,
+    ):
         self._llm = llm_client
         self._history: list[dict] = []
         self._history_limit = history_limit
+        self._memory = memory_manager
         self.should_exit = False
+
+    @property
+    def memory(self) -> MemoryManager | None:
+        return self._memory
 
     def reset(self) -> None:
         self._history = []
 
-    def respond(self, user_input: str, confirm: ConfirmCallback | None = None) -> str:
-        cmd = handle_command(user_input)
+    def respond(
+        self,
+        user_input: str,
+        confirm: ConfirmCallback | None = None,
+    ) -> str:
+
+        cmd = handle_command(
+            user_input,
+            memory_manager=self._memory,
+            confirm=confirm,
+        )
+
         if cmd.handled:
             if cmd.should_exit:
                 self.should_exit = True
+
             if cmd.output == "__RESET__":
                 self.reset()
                 return "Conversation history cleared."
+
             return cmd.output or ""
 
-        self._history.append({"role": "user", "content": user_input})
+        self._history.append(
+            {
+                "role": "user",
+                "content": user_input,
+            }
+        )
+
         self._trim_history()
 
         tools_schema = anthropic_tool_schemas()
 
+        memory_context = self._build_memory_context(
+            user_input
+        )
+
+        system_prompt = SYSTEM_PROMPT
+
+        if memory_context:
+            system_prompt += (
+                "\n\n"
+                "Relevant persistent memory for this request:\n"
+                f"{memory_context}"
+            )
+
         for _ in range(TOOL_LOOP_LIMIT):
-            response = self._llm.send(system=SYSTEM_PROMPT, messages=self._history, tools=tools_schema)
-            self._history.append({"role": "assistant", "content": _response_to_api_content(response)})
+
+            response = self._llm.send(
+                system=system_prompt,
+                messages=self._history,
+                tools=tools_schema,
+            )
+
+            self._history.append(
+                {
+                    "role": "assistant",
+                    "content": _response_to_api_content(response),
+                }
+            )
+
             self._trim_history()
 
             if response.stop_reason != "tool_use":
                 return _extract_text(response)
 
             tool_results = []
+
             for block in response.content:
                 if not isinstance(block, ToolUseBlock):
                     continue
-                tool_results.append(self._handle_tool_call(block, confirm))
 
-            self._history.append({"role": "user", "content": tool_results})
+                tool_results.append(
+                    self._handle_tool_call(
+                        block,
+                        confirm,
+                    )
+                )
+
+            self._history.append(
+                {
+                    "role": "user",
+                    "content": tool_results,
+                }
+            )
+
             self._trim_history()
 
-        return "I wasn't able to finish that after several tool calls -- try rephrasing the request."
+        return (
+            "I wasn't able to finish that after several tool calls "
+            "-- try rephrasing the request."
+        )
 
-    def _handle_tool_call(self, block: ToolUseBlock, confirm: ConfirmCallback | None) -> dict:
+    def _build_memory_context(
+        self,
+        user_input: str,
+    ) -> str:
+        if self._memory is None:
+            return ""
+
+        return self._memory.format_context(
+            user_input,
+            limit=8,
+        )
+
+    def _handle_tool_call(
+        self,
+        block: ToolUseBlock,
+        confirm: ConfirmCallback | None,
+    ) -> dict:
+
         tool = TOOLS.get(block.name)
+
         if tool is None:
-            return _tool_result(block.id, f"Error: unknown tool '{block.name}'.")
+            return _tool_result(
+                block.id,
+                f"Error: unknown tool '{block.name}'.",
+            )
 
         decision = guardian.review(tool)
+
         if decision.decision == guardian.CONFIRM:
-            approved = bool(confirm and confirm(tool.name, decision.risk_category, block.input))
+
+            approved = bool(
+                confirm
+                and confirm(
+                    tool.name,
+                    decision.risk_category,
+                    block.input,
+                )
+            )
+
             if not approved:
                 return _tool_result(
                     block.id,
-                    f"Denied by Guardian: '{tool.name}' is {decision.risk_category} risk "
+                    f"Denied by Guardian: '{tool.name}' "
+                    f"is {decision.risk_category} risk "
                     "and was not confirmed by the user.",
                 )
 
         try:
             output = tool.handler(**block.input)
-        except Exception as exc:  # noqa: BLE001 -- surfaced to the model, not swallowed
-            output = f"Error executing tool '{tool.name}': {exc}"
 
-        return _tool_result(block.id, output)
+        except Exception as exc:  # noqa: BLE001
+            output = (
+                f"Error executing tool '{tool.name}': {exc}"
+            )
+
+        return _tool_result(
+            block.id,
+            output,
+        )
 
     def _trim_history(self) -> None:
-        # Trims after every append so what's sent to the LLM always stays
-        # within history_limit. Known limitation: with a very small
-        # history_limit and an in-progress multi-step tool exchange, this
-        # can in principle split a tool_use from its matching tool_result,
-        # which the Anthropic API requires to stay paired. Not a practical
-        # issue at the default limit (40); full turn-aware trimming lands
-        # with proper memory management in v0.4.
+        """
+        Keep the current working context bounded.
+
+        Full turn-aware memory management will be addressed in a
+        later v0.4 milestone.
+        """
+
         if len(self._history) > self._history_limit:
-            self._history = self._history[-self._history_limit :]
+            self._history = self._history[
+                -self._history_limit:
+            ]
