@@ -68,3 +68,59 @@ def test_clear_removes_all_memory(tmp_path):
     manager.remember("Memory two.", importance=0.9)
     assert manager.clear() == 2
     assert manager.recent() == []
+def test_get_returns_memory_by_id(tmp_path):
+    manager = MemoryManager(
+        str(tmp_path / "memory.db")
+    )
+
+    memory = manager.remember(
+        "A.E.G.I.S. uses Gemma 4.",
+        memory_type=MemoryType.SEMANTIC,
+        importance=0.9,
+    )
+
+    assert memory is not None
+
+    retrieved = manager.get(memory.id)
+
+    assert retrieved is not None
+    assert retrieved.id == memory.id
+    assert retrieved.content == "A.E.G.I.S. uses Gemma 4."
+
+
+def test_get_returns_none_for_unknown_id(tmp_path):
+    manager = MemoryManager(
+        str(tmp_path / "memory.db")
+    )
+
+    assert manager.get(
+        "does-not-exist"
+    ) is None
+
+
+def test_format_memory_contains_metadata(tmp_path):
+    manager = MemoryManager(
+        str(tmp_path / "memory.db")
+    )
+
+    memory = manager.remember(
+        "A.E.G.I.S. uses Gemma 4.",
+        memory_type=MemoryType.SEMANTIC,
+        importance=0.9,
+        confidence=0.95,
+        sensitivity=0.1,
+        source="test",
+        tags=["aegis", "llm"],
+    )
+
+    assert memory is not None
+
+    formatted = manager.format_memory(memory)
+
+    assert memory.id in formatted
+    assert "semantic" in formatted
+    assert "Gemma 4" in formatted
+    assert "0.90" in formatted
+    assert "0.95" in formatted
+    assert "test" in formatted
+    assert "aegis" in formatted

@@ -105,10 +105,10 @@ def _memory_help() -> str:
         "  /memory remember <text>    - explicitly store a memory\n"
         "  /memory recall <query>     - search memories\n"
         "  /memory recent             - show recent memories\n"
+        "  /memory inspect <id>       - inspect one memory\n"
         "  /memory forget <id>        - delete one memory\n"
         "  /memory clear              - delete all memories"
     )
-
 
 def handle_command(
     text: str,
@@ -248,6 +248,28 @@ def _handle_memory_command(
             output=_format_memories(
                 memory_manager.recent(limit=10)
             ),
+        )
+
+    if action == "inspect":
+        if len(args) < 2 or not args[1].strip():
+            return CommandResult(
+                handled=True,
+                output="Usage: /memory inspect <memory-id>",
+            )
+
+        memory_id = args[1].strip()
+
+        memory = memory_manager.get(memory_id)
+
+        if memory is None:
+            return CommandResult(
+                handled=True,
+                output=f"No memory found with ID: {memory_id}",
+            )
+
+        return CommandResult(
+            handled=True,
+            output=memory_manager.format_memory(memory),
         )
 
     if action == "forget":
