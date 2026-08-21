@@ -25,17 +25,35 @@ from __future__ import annotations
 
 from typing import Callable
 
+from numpy import block
+
 from core import guardian
+
 from core.llm_client import (
     LLMResponse,
     TextBlock,
     ToolUseBlock,
 )
+
+
+
+from core.tool_gateway import (
+    ToolGateway,
+)
+
+from core.tool_audit_store import (
+    SQLiteToolAuditStore,
+)
+
 from core.tools import (
     TOOLS,
     anthropic_tool_schemas,
 )
+from core.tool_security_review import (
+    ToolSecurityReviewer,
+)
 from memory import MemoryManager, MemoryType
+
 from memory.extractor import MemoryExtractor
 
 
@@ -468,10 +486,37 @@ class AEGIS:
         history_limit: int = 40,
         memory_manager: MemoryManager | None = None,
         memory_extractor: MemoryExtractor | None = None,
+        tool_gateway: ToolGateway | None = None,
+        tool_audit_store: SQLiteToolAuditStore | None = None,
     ):
         self._llm = llm_client
         self._history: list[dict] = []
         self._history_limit = history_limit
+
+        # ---------------------------------------------------------
+        # Tool audit persistence
+        # ---------------------------------------------------------
+
+        self._tool_audit_store = (
+            tool_audit_store
+            if tool_audit_store is not None
+            else SQLiteToolAuditStore()
+        )
+
+        # ---------------------------------------------------------
+        # Tool execution gateway
+        # ---------------------------------------------------------
+
+        self._tool_gateway = (
+            tool_gateway
+            if tool_gateway is not None
+            else ToolGateway(
+                audit_store=self._tool_audit_store,
+                security_reviewer=ToolSecurityReviewer(
+                    self._tool_audit_store
+                ),
+            )
+        )
 
         self._memory = memory_manager
 
@@ -489,9 +534,45 @@ class AEGIS:
 
         self.should_exit = False
 
+    
     @property
     def memory(self) -> MemoryManager | None:
         return self._memory
+
+    @property
+    def tool_audit(self) -> SQLiteToolAuditStore:
+        """
+        Return the persistent tool-audit store.
+        """
+
+        return self._tool_audit_store
+
+    @property
+    def tool_security(
+        self,
+    ):
+        """
+        Return a read-only security analyzer over
+        the current tool-audit history.
+        """
+
+        return (
+            self._tool_audit_store
+            .security_analysis()
+        )
+
+    @property
+    def security_review(
+        self,
+    ) -> ToolSecurityReviewer:
+        """
+        Return a read-only security reviewer over
+        the current tool-audit history.
+        """
+
+        return ToolSecurityReviewer(
+            self._tool_audit_store
+        )
 
     def reset(self) -> None:
         self._history = []
@@ -682,6 +763,19 @@ class AEGIS:
         block: ToolUseBlock,
         confirm: ConfirmCallback | None,
     ) -> dict:
+        """
+        Execute an LLM-requested tool through ToolGateway.
+
+        ToolGateway is responsible for:
+            - Guardian review
+            - risk classification
+            - confirmation enforcement
+            - handler execution
+            - handler error handling
+
+        AEGIS only translates the gateway result into
+        the tool-result format expected by the LLM.
+        """
 
         tool = TOOLS.get(
             block.name
@@ -693,44 +787,98 @@ class AEGIS:
                 f"Error: unknown tool '{block.name}'.",
             )
 
-        decision = guardian.review(
-            tool
+    # -----------------------------------------------------
+    # First gateway call
+    #
+    # This determines whether Guardian allows automatic
+    # execution or requires confirmation.
+    # -----------------------------------------------------
+
+        preview = self._tool_gateway.execute(
+            tool,
+            block.input,
         )
 
-        if decision.decision == guardian.CONFIRM:
+    # -----------------------------------------------------
+    # Confirmation-required tool
+    # -----------------------------------------------------
 
-            approved = bool(
-                confirm
-                and confirm(
+        if preview.requires_confirmation:
+
+            if confirm is None:
+                return _tool_result(
+                    block.id,
+                    (
+                        f"Denied by Guardian: "
+                        f"'{tool.name}' requires confirmation."
+                    ),
+                )
+
+            confirmed = bool(
+                confirm(
                     tool.name,
-                    decision.risk_category,
+                    tool.risk_category,
                     block.input,
                 )
             )
 
-            if not approved:
+            if not confirmed:
                 return _tool_result(
                     block.id,
-                    f"Denied by Guardian: '{tool.name}' "
-                    f"is {decision.risk_category} risk "
-                    "and was not confirmed by the user.",
+                    (
+                        f"Denied by Guardian: "
+                        f"'{tool.name}' was not confirmed."
+                    ),
                 )
 
-        try:
-            output = tool.handler(
-                **block.input
+        # Explicit confirmation allows the gateway
+        # to perform the actual handler execution.
+            result = self._tool_gateway.execute(
+                tool,
+                block.input,
+                confirmed=True,
             )
 
-        except Exception as exc:
-            output = (
-                f"Error executing tool "
-                f"'{tool.name}': {exc}"
+        else:
+            # LOW-risk tools are executed automatically.
+            result = preview
+
+    # -----------------------------------------------------
+    # Successful execution
+    # -----------------------------------------------------
+
+        if result.executed:
+            return _tool_result(
+                block.id,
+                result.result or "",
             )
+
+    # -----------------------------------------------------
+    # Handler failure
+    # -----------------------------------------------------
+
+        if result.error:
+            return _tool_result(
+                block.id,
+                (
+                    f"Error executing tool "
+                    f"'{tool.name}': "
+                    f"{result.error}"
+                ),
+            )
+
+    # -----------------------------------------------------
+    # Defensive fallback
+    # -----------------------------------------------------
 
         return _tool_result(
             block.id,
-            output,
+            (
+                f"Tool '{tool.name}' "
+                "was not executed."
+            ),
         )
+
 
     # =========================================================
     # HISTORY
