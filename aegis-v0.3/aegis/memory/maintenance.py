@@ -10,17 +10,21 @@ Important:
 
 It only answers:
 
-    "Given the current health of this memory,
+    "Given the current health and usage of this memory,
      what maintenance action should A.E.G.I.S. propose?"
 
 Actual lifecycle mutation remains the responsibility of
 MemoryManager and, eventually, the Guardian layer.
+
+Usage information is observational evidence only.
+It does not directly trigger mutations.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime
 
 from .health import (
     MemoryHealth,
@@ -28,6 +32,7 @@ from .health import (
     MemoryHealthReport,
 )
 from .models import Memory
+from .usage import MemoryUsage
 
 
 class MaintenanceAction(str, Enum):
@@ -50,6 +55,10 @@ class MaintenanceProposal:
     Immutable maintenance proposal.
 
     No memory is modified.
+
+    Usage fields are copied from the health report so that the
+    proposal contains the evidence that contributed to the
+    health assessment.
     """
 
     memory_id: str
@@ -64,10 +73,22 @@ class MaintenanceProposal:
 
     requires_confirmation: bool = False
 
+    # =========================================================
+    # USAGE EVIDENCE
+    # =========================================================
+
+    retrieval_count: int = 0
+
+    access_count: int = 0
+
+    days_since_retrieval: float | None = None
+
+    has_been_retrieved: bool = False
+
 
 class MemoryMaintenancePlanner:
     """
-    Deterministic first-generation memory maintenance planner.
+    Deterministic memory maintenance planner.
 
     Mapping:
 
@@ -86,7 +107,11 @@ class MemoryMaintenancePlanner:
     The planner only proposes actions.
 
     It never calls MemoryManager.
+
     It never modifies Memory objects.
+
+    Usage is supplied to the health analyzer as additional
+    observational evidence.
     """
 
     def __init__(
@@ -107,16 +132,45 @@ class MemoryMaintenancePlanner:
         self,
         memory: Memory,
         *,
-        now=None,
+        usage: MemoryUsage | None = None,
+        now: datetime | None = None,
     ) -> MaintenanceProposal:
         """
         Analyze one memory and produce a maintenance proposal.
 
+        Parameters
+        ----------
+        memory:
+            Memory to analyze.
+
+        usage:
+            Optional usage statistics associated with the memory.
+
+        now:
+            Optional reference time for deterministic testing.
+
         No memory is modified.
         """
 
+        if not isinstance(
+            memory,
+            Memory,
+        ):
+            raise TypeError(
+                "memory must be a Memory instance"
+            )
+
+        if usage is not None and not isinstance(
+            usage,
+            MemoryUsage,
+        ):
+            raise TypeError(
+                "usage must be a MemoryUsage instance"
+            )
+
         report = self.analyzer.analyze(
             memory,
+            usage=usage,
             now=now,
         )
 
@@ -128,16 +182,47 @@ class MemoryMaintenancePlanner:
         self,
         memories: list[Memory],
         *,
-        now=None,
+        usages: dict[str, MemoryUsage] | None = None,
+        now: datetime | None = None,
     ) -> list[MaintenanceProposal]:
         """
         Produce maintenance proposals for multiple memories.
 
+        `usages` maps memory IDs to MemoryUsage objects.
+
         Input order is preserved.
+
+        Missing usage entries are treated as zero usage.
         """
+
+        if usages is None:
+            usages = {}
+
+        # -----------------------------------------------------
+        # Validate the usage mapping before analysis.
+        # -----------------------------------------------------
+
+        for memory_id, usage in usages.items():
+
+            if not isinstance(
+                memory_id,
+                str,
+            ):
+                raise TypeError(
+                    "usage map keys must be strings"
+                )
+
+            if not isinstance(
+                usage,
+                MemoryUsage,
+            ):
+                raise TypeError(
+                    "usage map values must be MemoryUsage instances"
+                )
 
         reports = self.analyzer.analyze_many(
             memories,
+            usages=usages,
             now=now,
         )
 
@@ -157,6 +242,8 @@ class MemoryMaintenancePlanner:
 
         The report must already contain all required information,
         allowing this method to remain completely read-only.
+
+        Usage information is preserved from the health report.
         """
 
         if not isinstance(
@@ -192,6 +279,18 @@ class MemoryMaintenancePlanner:
             reason=reason,
             requires_confirmation=(
                 requires_confirmation
+            ),
+            retrieval_count=(
+                report.retrieval_count
+            ),
+            access_count=(
+                report.access_count
+            ),
+            days_since_retrieval=(
+                report.days_since_retrieval
+            ),
+            has_been_retrieved=(
+                report.has_been_retrieved
             ),
         )
 
@@ -236,12 +335,22 @@ class MemoryMaintenancePlanner:
     ) -> str:
         """
         Produce a deterministic explanation for the proposal.
+
+        Usage evidence can influence the wording but does not
+        change the underlying action mapping.
         """
 
         if (
             action
             == MaintenanceAction.NO_ACTION
         ):
+            if report.has_been_retrieved:
+                return (
+                    "The memory is healthy and has demonstrated "
+                    "retrieval usage, so no maintenance is "
+                    "currently required."
+                )
+
             return (
                 "The memory is healthy and does not "
                 "currently require maintenance."
@@ -251,6 +360,13 @@ class MemoryMaintenancePlanner:
             action
             == MaintenanceAction.REVIEW
         ):
+            if report.has_been_retrieved:
+                return (
+                    "The memory is aging but has demonstrated "
+                    "retrieval usage. It should be reviewed "
+                    "before stronger lifecycle action is proposed."
+                )
+
             return (
                 "The memory is aging and should be reviewed "
                 "before stronger lifecycle action is proposed."
@@ -260,6 +376,13 @@ class MemoryMaintenancePlanner:
             action
             == MaintenanceAction.MARK_STALE
         ):
+            if report.has_been_retrieved:
+                return (
+                    "The memory is a stale candidate but has "
+                    "demonstrated retrieval usage. Marking it "
+                    "stale should require explicit confirmation."
+                )
+
             return (
                 "The memory is a stale candidate. Marking it "
                 "stale should require explicit confirmation."
@@ -269,6 +392,13 @@ class MemoryMaintenancePlanner:
             action
             == MaintenanceAction.ARCHIVE
         ):
+            if report.has_been_retrieved:
+                return (
+                    "The memory is an archival candidate but "
+                    "has recorded retrieval usage. Archiving "
+                    "should require explicit confirmation."
+                )
+
             return (
                 "The memory is an archival candidate. "
                 "Archiving should require explicit confirmation."

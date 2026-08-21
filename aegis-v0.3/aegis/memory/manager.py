@@ -111,6 +111,28 @@ class MemoryManager:
             resolver=self.conflict_resolver,
         )
 
+            # -----------------------------------------------------
+        # Maintenance service
+        # -----------------------------------------------------
+        #
+        # Imported locally to avoid a circular dependency:
+        #
+        #   MemoryManager
+        #       ↓
+        #   MemoryMaintenanceService
+        #       ↓
+        #   MemoryManager
+        #
+        from .maintenance_service import (
+            MemoryMaintenanceService,
+        )
+
+        self.maintenance = (
+            MemoryMaintenanceService(
+                self
+            )
+        )
+
     # =========================================================
     # BASIC MEMORY STORAGE
     # =========================================================

@@ -44,6 +44,22 @@ from .usage_store import (
     SQLiteMemoryUsageStore,
 )
 
+from .policy import (
+    MemoryPolicy,
+    MemoryPolicyDecision,
+)
+
+from .maintenance_executor import (
+    MaintenanceExecutionResult,
+    MemoryMaintenanceExecutor,
+)
+
+from .maintenance_service import (
+    MaintenanceBatchEvaluation,
+    MaintenanceEvaluation,
+    MemoryMaintenanceService,
+)
+
 __all__ = [
     "ConflictResult",
     "MemoryConflictDetector",
@@ -67,4 +83,11 @@ __all__ = [
     "MemoryMaintenancePlanner",
     "MemoryUsage",
     "SQLiteMemoryUsageStore",
+    "MemoryPolicy",
+    "MemoryPolicyDecision",
+    "MaintenanceExecutionResult",
+    "MemoryMaintenanceExecutor",
+    "MaintenanceBatchEvaluation",
+    "MaintenanceEvaluation",
+    "MemoryMaintenanceService",
 ]
